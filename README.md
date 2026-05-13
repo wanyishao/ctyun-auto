@@ -63,7 +63,7 @@ docker-compose up -d
 容器正常运行后，如果您希望积攒的积分能自动兑换指定的云电脑配置时长或奖励，请在宿主机执行以下命令进入交互配置引导：
 
 ```bash
-docker exec -it ctyun_sign_auto python3 /app/pc_login.py --config-redeem
+docker exec -it ctyun-auto python3 /app/pc_login.py --config-redeem
 
 ```
 
