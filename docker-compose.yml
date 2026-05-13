@@ -2,28 +2,18 @@ version: '3.8'
 
 services:
   ctyun-auto:
-    build:
-      context: ./app
-      dockerfile: Dockerfile
-    image: ctyun-auto-sign:v2
+    # 从 GitHub Container Registry 拉取镜像
+    image: ghcr.io/wanyishao/ctyun-auto:latest
     container_name: ctyun_sign_auto
-    restart: unless-stopped
+    restart: on-failure
     volumes:
       - ./data:/app/data
     extra_hosts:
       - "deskcdn.ctyun.cn:106.120.187.154"
       - "deskcdn.ctyun.cn.ctadns.cn:106.120.187.154"
     environment:
-      # 【必填】你的天翼云账号和密码
       - APP_USER=你的账号
       - APP_PASSWORD=你的密码
-      
-      # 【可选】定时任务的时间表达式 (留空则使用默认时间)
       - CRON_LOGIN=0 3,20 * * *
       - CRON_PC=0 4,6 * * *
-      
-      # 【可选】首次部署时设为 true，启动时会自动立刻执行一遍任务。之后可改回 false。
-      - INIT_RUN=true
-      
-      # 【可选】自定义设备码，如不填系统会自动生成并保存在 data 目录中
-      # - DEVICECODE=web_xxxxxx
+      - INIT_RUN=false
