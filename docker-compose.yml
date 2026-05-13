@@ -8,15 +8,21 @@ services:
     restart: on-failure
     volumes:
       - ./data:/app/data
+#      - ./data/redeem_config.json:/app/redeem_config.json
+      # 若需要持久化自动兑换配置，在本地创建redeem_config.json文件，默认不启用，无需配置
     extra_hosts:
       - "deskcdn.ctyun.cn:106.120.187.154"
       - "deskcdn.ctyun.cn.ctadns.cn:106.120.187.154"
     environment:
       - APP_USER=你的账号
       - APP_PASSWORD=你的密码
+      # 默认定时任务配置，可根据需要修改
       - CRON_LOGIN=0 3,20 * * *
+      # AI 对话任务：每天 03:00 和 20:00 执行
       - CRON_PC=0 4,6 * * *
+      # 挂机任务：每天 04:00 和 06:00 执行
       - INIT_RUN=false
+      # 若设为 true，容器首次启动时会无视 cron 立即执行一次任务
     logging:
       driver: "json-file"
       options:
