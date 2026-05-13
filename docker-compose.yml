@@ -3,7 +3,7 @@ version: '3.8'
 services:
   ctyun-auto:
     image: ghcr.io/wanyishao/ctyun-auto:latest
-    container_name: ctyun_auto
+    container_name: ctyun-auto
     network_mode: "bridge"
     restart: on-failure
     volumes:
