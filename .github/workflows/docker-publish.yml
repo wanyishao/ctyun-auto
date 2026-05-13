@@ -1,0 +1,45 @@
+name: Build and Push to GHCR
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'app/**'         # 只有 app 目录改动时才触发自动构建
+  workflow_dispatch:     # 允许在 GitHub Actions 页面手动触发构建
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    # 【必须】声明 packages 写入权限，允许自带的 token 推送镜像
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # Github 自动提供的 Token，无需手动配置
+
+      # 将拥有者名字转为小写 (Docker 镜像仓库名必须是全小写)
+      - name: Convert owner to lower case
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "REPO_OWNER=$OWNER" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          # 镜像标签格式：ghcr.io/你的用户名/镜像名:latest
+          tags: ghcr.io/${{ env.REPO_OWNER }}/ctyun-auto:latest
