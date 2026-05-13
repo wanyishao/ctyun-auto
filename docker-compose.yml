@@ -4,6 +4,7 @@ services:
   ctyun-auto:
     image: ghcr.io/wanyishao/ctyun-auto:latest
     container_name: ctyun_auto
+    network_mode: "bridge"
     restart: on-failure
     volumes:
       - ./data:/app/data
@@ -16,3 +17,8 @@ services:
       - CRON_LOGIN=0 3,20 * * *
       - CRON_PC=0 4,6 * * *
       - INIT_RUN=false
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
