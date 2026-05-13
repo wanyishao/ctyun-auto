@@ -2,7 +2,6 @@ version: '3.8'
 
 services:
   ctyun-auto:
-    # 从 GitHub Container Registry 拉取镜像
     image: ghcr.io/wanyishao/ctyun-auto:latest
     container_name: ctyun_auto
     restart: on-failure
