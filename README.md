@@ -68,6 +68,14 @@ docker exec -it ctyun-auto python3 /app/pc_login.py --config-redeem
 ```
 
 根据终端提示，依次选择“要应用配置的设备”、“兑换的商品”以及“兑换策略”（推荐选择按每月特定日期兑换）。
+配置文件位于`/app/redeem_config.json`，默认不启用，若需要持久化自动兑换配置，在本地创建`redeem_config.json`文件，并修改`docker-compose.yml`文件，添加`- ./data/redeem_config.json:/app/redeem_config.json`。
+
+```yaml
+    volumes:
+      - ./data:/app/data
+      - ./data/redeem_config.json:/app/redeem_config.json
+
+```
 
 ### 常用管理命令
 
