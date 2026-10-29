@@ -34,6 +34,7 @@ POINTS_TASK_LIST_URL = (
     "https://desk.ctyun.cn/selforder/api/marketing/userPoints/getTaskList"
 )
 RESTART_AT_FILE = "/tmp/ctyun_restart_at"
+MAX_DESKTOP_OPEN_ATTEMPTS = 3
 
 
 def init_browser_options(running_in_docker: bool) -> ChromiumOptions:
@@ -344,33 +345,123 @@ def click_enter_ai_pc(page: ChromiumPage) -> bool:
     return False
 
 
+def click_visible_text(page: ChromiumPage, text: str) -> bool:
+    """点击页面中可见且包含指定文字的最内层元素。"""
+    script = f"""
+        const label = {json.dumps(text, ensure_ascii=False)};
+        const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
+        const candidates = Array.from(document.querySelectorAll('body *'));
+        const target = candidates.find(element => {{
+            if (!element.getClientRects().length) return false;
+            const elementText = normalize(element.innerText || element.textContent);
+            if (!elementText.includes(label)) return false;
+            return !Array.from(element.children).some(child =>
+                normalize(child.innerText || child.textContent).includes(label)
+            );
+        }});
+        if (!target) return false;
+        target.click();
+        return true;
+    """
+    try:
+        return bool(page.run_js(script))
+    except Exception:
+        return False
+
+
+def get_points_page_hints(page: ChromiumPage) -> str:
+    """提取与连接状态和积分入口相关的可见页面文字。"""
+    try:
+        lines = page.run_js(
+            """return (document.body ? document.body.innerText : '')
+                .split('\\n')
+                .map(line => line.trim())
+                .filter(line => /积分|控制中心|连接|断开|重连|超时|退出|加载失败|网络异常/.test(line))
+                .slice(0, 12);"""
+        )
+        if isinstance(lines, list) and lines:
+            return " | ".join(str(line) for line in lines)
+    except Exception:
+        pass
+    return "未发现连接状态或积分中心相关文字"
+
+
+def get_desktop_page_text(page: ChromiumPage) -> str:
+    """读取云电脑页面可见文字，用于判断连接状态。"""
+    try:
+        value = page.run_js(
+            "return document.body ? document.body.innerText : '';"
+        )
+        return str(value or "")
+    except Exception:
+        return ""
+
+
 def wait_desktop_opened(page: ChromiumPage, timeout: int = 270) -> bool:
-    """等待进入云电脑页面。"""
+    """等待云电脑连接完成，而不只等待 URL 切换。"""
     end_time = time.time() + timeout
+    ready_markers = (
+        "控制中心",
+        "积分中心",
+        "快捷应用",
+        "网络时延",
+        "家庭管理",
+        "安全中心",
+    )
+    connecting_markers = (
+        "正在通过加密通道进行连接",
+        "正在为您连接AI云电脑",
+        "正在为您重连",
+        "连接已断开",
+    )
     while time.time() < end_time:
         current_url = page.url or ""
-        if DESKTOP_DETAIL_URL_KEY in current_url:
-            return True
         if "/login" in current_url:
             return False
+
+        if DESKTOP_DETAIL_URL_KEY in current_url:
+            page_text = get_desktop_page_text(page)
+            if "连接AI云电脑超时" in page_text or "连接超时" in page_text:
+                print("[!] 页面报告云电脑连接超时。")
+                return False
+            if any(marker in page_text for marker in connecting_markers):
+                time.sleep(1)
+                continue
+            if any(marker in page_text for marker in ready_markers):
+                return True
         time.sleep(0.5)
-    print("[*] 进入云电脑超时。")
+    print("[*] 等待云电脑连接完成超时。")
+    print(f"[-] 页面状态: {get_points_page_hints(page)}")
     return False
 
 
 def open_points_center_and_print(page: ChromiumPage, timeout: int = 60) -> int:
     """打开积分中心并输出积分详情。"""
     try:
-        locator = "xpath://span[contains(string(), '积分中心')]"
-        target_element = page.ele(locator, timeout=120)
-
-        if not target_element:
-            print("\r[-] 未找到积分中心入口。")
-            return 0
-
-        clicked = target_element.click(by_js=True)
+        clicked = click_visible_text(page, "积分中心")
         if not clicked:
-            print("\r[-] 积分中心入口点击失败。")
+            # 工具栏可能在进入云电脑后延迟加载；最多等待 120 秒。
+            end_time = time.time() + 120
+            control_center_opened = False
+            while time.time() < end_time:
+                if click_visible_text(page, "积分中心"):
+                    clicked = True
+                    break
+
+                # 新版工具栏将积分中心收在“控制中心”面板内。
+                if not control_center_opened and click_visible_text(
+                    page, "控制中心"
+                ):
+                    control_center_opened = True
+                    end_time = time.time() + 15
+                    continue
+                time.sleep(0.5)
+
+        if not clicked:
+            print(
+                "\r[-] 未找到积分中心入口。"
+                f" 页面提示: {get_points_page_hints(page)}"
+            )
             return 0
         time.sleep(5)
         end_time = time.time() + timeout
@@ -1143,6 +1234,7 @@ def main(config_redeem_only: bool = False) -> None:
         relogin_attempts = 0
         max_relogin_attempts = 3
         unknown_attempts = 0
+        desktop_open_attempts = 0
         desktop_opened = False
 
         while True:
@@ -1175,21 +1267,47 @@ def main(config_redeem_only: bool = False) -> None:
                 sys.exit(0)
 
             if state == "has_pc_button":
-                print("[*] 检测到“进入AI云电脑”按钮，准备进入云电脑。")
+                if desktop_open_attempts >= MAX_DESKTOP_OPEN_ATTEMPTS:
+                    print("[!] 云电脑连接重试次数达到上限，任务结束。")
+                    sys.exit(1)
+                desktop_open_attempts += 1
+                print(
+                    "[*] 检测到“进入AI云电脑”按钮，尝试连接云电脑 "
+                    f"({desktop_open_attempts}/{MAX_DESKTOP_OPEN_ATTEMPTS})。"
+                )
                 if not click_enter_ai_pc(page):
                     print("[!] 未能点击“进入AI云电脑”按钮。")
+                    if desktop_open_attempts >= MAX_DESKTOP_OPEN_ATTEMPTS:
+                        print("[!] 云电脑连接重试次数达到上限，任务结束。")
+                        sys.exit(1)
                     continue
                 if not wait_desktop_opened(page, timeout=240):
-                    print("[!] 点击后未进入云电脑页面。")
+                    print("[!] 云电脑尚未连接成功。")
+                    if desktop_open_attempts >= MAX_DESKTOP_OPEN_ATTEMPTS:
+                        print("[!] 云电脑连接重试次数达到上限，任务结束。")
+                        sys.exit(1)
                     continue
 
                 desktop_opened = True
                 break
 
             if state == "desktop_entered_auto":
-                print("[*] 已自动进入云电脑页面。")
-                desktop_opened = True
-                break
+                if desktop_open_attempts >= MAX_DESKTOP_OPEN_ATTEMPTS:
+                    print("[!] 云电脑连接重试次数达到上限，任务结束。")
+                    sys.exit(1)
+                desktop_open_attempts += 1
+                print(
+                    "[*] 页面已跳转，正在等待云电脑连接 "
+                    f"({desktop_open_attempts}/{MAX_DESKTOP_OPEN_ATTEMPTS})。"
+                )
+                if wait_desktop_opened(page, timeout=240):
+                    desktop_opened = True
+                    break
+                print("[!] 云电脑尚未连接成功。")
+                if desktop_open_attempts >= MAX_DESKTOP_OPEN_ATTEMPTS:
+                    print("[!] 云电脑连接重试次数达到上限，任务结束。")
+                    sys.exit(1)
+                continue
 
             unknown_attempts += 1
             if unknown_attempts >= 3:

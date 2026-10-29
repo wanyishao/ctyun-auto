@@ -1,0 +1,21 @@
+# Local state, credentials, and screenshots must not enter a Docker build context.
+.git/
+**/.git/
+data/
+**/data/
+.env
+**/.env
+*.json
+**/*.json
+.devicecode_*
+**/.devicecode_*
+ctyun_authData_*
+**/ctyun_authData_*
+ctyun_cookies_*
+**/ctyun_cookies_*
+chrome_profile_*
+**/chrome_profile_*
+*.png
+**/*.png
+*.jpg
+**/*.jpg

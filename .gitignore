@@ -1,8 +1,18 @@
-# 忽略挂载的数据目录（包含你的 Cookie 和截图）
+# 本地持久化数据、登录态和截图不提交到 GitHub
 data/
-/chrome_profile_*/
+**/data/
+chrome_profile_*/
+**/chrome_profile_*/
+.devicecode_*
+**/.devicecode_*
+ctyun_authData_*
+**/ctyun_authData_*
+ctyun_cookies_*
+**/ctyun_cookies_*
 *.json
 *.png
+*.jpg
+*.jpeg
 
 # 忽略 Python 缓存文件
 __pycache__/
@@ -10,8 +20,3 @@ __pycache__/
 
 # 忽略可能包含环境变量的文件
 .env
-
-# 忽略其他
-app/.devicecode_*
-app/ctyun_authData_*
-app/*.jpg
