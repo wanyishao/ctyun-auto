@@ -34,7 +34,7 @@ POINTS_TASK_LIST_URL = (
     "https://desk.ctyun.cn/selforder/api/marketing/userPoints/getTaskList"
 )
 RESTART_AT_FILE = "/tmp/ctyun_restart_at"
-MAX_DESKTOP_OPEN_ATTEMPTS = 3
+MAX_DESKTOP_OPEN_ATTEMPTS = 1
 
 
 def init_browser_options(running_in_docker: bool) -> ChromiumOptions:
@@ -135,7 +135,7 @@ def inject_auth_data_if_exists(page: ChromiumPage, auth_data_file: str) -> None:
     )
     auth_data_text = json.dumps(auth_data, ensure_ascii=False, separators=(",", ":"))
     page.run_js(f"localStorage.setItem('authData', {json.dumps(auth_data_text)});")
-    print(f"[*] 已注入 localStorage.authData: {auth_data_file}")
+    print("[*] 已注入本地 localStorage.authData。")
 
 
 def inject_local_storage_session(
@@ -1217,6 +1217,15 @@ def main(config_redeem_only: bool = False) -> None:
         print("[!] 缺少环境变量 APP_USER 或 APP_PASSWORD。")
         sys.exit(1)
 
+    if not config_redeem_only:
+        pause_file = os.getenv(
+            "PC_TASK_PAUSE_FILE",
+            "/app/data/.pause_pc_login" if running_in_docker else "./.pause_pc_login",
+        )
+        if os.path.exists(pause_file):
+            print("[*] 检测到云电脑挂机暂停标记，跳过本次任务。")
+            return
+
     auth_data_file = get_auth_data_file(username, running_in_docker)
     device_code = get_device_code(username, running_in_docker)
 
@@ -1283,10 +1292,8 @@ def main(config_redeem_only: bool = False) -> None:
                     continue
                 if not wait_desktop_opened(page, timeout=240):
                     print("[!] 云电脑尚未连接成功。")
-                    if desktop_open_attempts >= MAX_DESKTOP_OPEN_ATTEMPTS:
-                        print("[!] 云电脑连接重试次数达到上限，任务结束。")
-                        sys.exit(1)
-                    continue
+                    print("[!] 为避免重复连接重置桌面会话，本次停止重试。")
+                    sys.exit(1)
 
                 desktop_opened = True
                 break
@@ -1304,10 +1311,8 @@ def main(config_redeem_only: bool = False) -> None:
                     desktop_opened = True
                     break
                 print("[!] 云电脑尚未连接成功。")
-                if desktop_open_attempts >= MAX_DESKTOP_OPEN_ATTEMPTS:
-                    print("[!] 云电脑连接重试次数达到上限，任务结束。")
-                    sys.exit(1)
-                continue
+                print("[!] 为避免重复连接重置桌面会话，本次停止重试。")
+                sys.exit(1)
 
             unknown_attempts += 1
             if unknown_attempts >= 3:
@@ -1323,7 +1328,7 @@ def main(config_redeem_only: bool = False) -> None:
         auth_data = read_auth_data(page)
         mobile = auth_data.get("mobilephone") if auth_data else None
         if mobile:
-            print(f"[*] 登录成功账号: {mobile}")
+            print("[*] 登录成功。")
         else:
             print("[-] 登录成功，但未能读取 authData.mobilephone。")
 

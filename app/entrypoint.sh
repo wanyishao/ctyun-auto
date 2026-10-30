@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+umask 077
 
 # 1. 验证必须的基础环境变量
 if [ -z "$APP_USER" ] || [ -z "$APP_PASSWORD" ]; then
@@ -13,27 +14,27 @@ RESTART_AT_FILE="/tmp/ctyun_restart_at"
 # 2. DEVICECODE 配置逻辑
 if [ -n "$DEVICECODE" ]; then
     echo "$DEVICECODE" > "$DEVICECODE_FILE"
-    echo "[*] 检测到传入的 DEVICECODE: $DEVICECODE"
+    echo "[*] 检测到传入的 DEVICECODE，已保存。"
 elif [ -f "$DEVICECODE_FILE" ]; then
     export DEVICECODE=$(cat "$DEVICECODE_FILE")
-    echo "[*] 读取到已保存的 DEVICECODE: $DEVICECODE"
+    echo "[*] 已读取保存的 DEVICECODE。"
 else
     export DEVICECODE="web_$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)"
     echo "$DEVICECODE" > "$DEVICECODE_FILE"
-    echo "[*] 首次启动，已生成并持久化 DEVICECODE: $DEVICECODE"
+    echo "[*] 首次启动，已生成并持久化 DEVICECODE。"
 fi
 
 # 写入所有环境变量供 cron 进程读取（确保 Python 脚本能获取账号密码等）
-env >> /etc/environment
+env > /etc/environment
+chmod 0600 /etc/environment
 
 # 3. 动态生成 Cron 配置
 CRON_LOGIN_EXPR="${CRON_LOGIN:-0 3,20 * * *}"
 CRON_PC_EXPR="${CRON_PC:-0 4,6 * * *}"
 
-echo "$CRON_LOGIN_EXPR root /usr/bin/python3 /app/login_script.py > /proc/1/fd/1 2>&1" > /etc/cron.d/ctyun-cron
-echo "$CRON_PC_EXPR root /usr/bin/python3 /app/pc_login.py > /proc/1/fd/1 2>&1" >> /etc/cron.d/ctyun-cron
+echo "$CRON_LOGIN_EXPR root /app/run_task.sh ai /usr/bin/python3 /app/login_script.py > /proc/1/fd/1 2>&1" > /etc/cron.d/ctyun-cron
+echo "$CRON_PC_EXPR root /app/run_task.sh pc /usr/bin/python3 -u /app/pc_login.py > /proc/1/fd/1 2>&1" >> /etc/cron.d/ctyun-cron
 chmod 0644 /etc/cron.d/ctyun-cron
-crontab /etc/cron.d/ctyun-cron
 
 service cron start
 echo "[*] Cron 定时服务已启动。"
@@ -43,8 +44,8 @@ echo "    - 云电脑挂机: $CRON_PC_EXPR"
 # 4. 首次运行自动触发机制 (相当于原 deploy.sh 首次脱离时的动作)
 if [ "${INIT_RUN:-false}" == "true" ]; then
     echo "[*] 检测到 INIT_RUN=true，开始执行初始积分与挂机任务..."
-    python3 /app/login_script.py || true
-    nohup env PYTHONUNBUFFERED=1 python3 -u /app/pc_login.py > /app/data/pc_login_once.log 2>&1 &
+    /app/run_task.sh ai /usr/bin/python3 /app/login_script.py || true
+    nohup env PYTHONUNBUFFERED=1 /app/run_task.sh pc /usr/bin/python3 -u /app/pc_login.py > /app/data/pc_login_once.log 2>&1 &
 fi
 
 set +e

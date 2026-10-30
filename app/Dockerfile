@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y \
     chromium-driver \
     fonts-wqy-zenhei \
     cron \
+    util-linux \
     libgl1 \
     libglib2.0-0 \
     dos2unix \
@@ -28,10 +29,12 @@ RUN pip3 install --no-cache-dir DrissionPage==4.0.4.19 ddddocr --break-system-pa
 # 6. 将 Python 脚本和启动脚本复制到工作目录
 COPY login_script.py /app/login_script.py
 COPY pc_login.py /app/pc_login.py
+COPY run_task.sh /app/run_task.sh
 COPY entrypoint.sh /app/entrypoint.sh
 
 # 7. 修复 Windows 环境下可能产生的 CRLF 换行符问题，并赋予执行权限
-RUN dos2unix /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+RUN dos2unix /app/entrypoint.sh /app/run_task.sh \
+    && chmod +x /app/entrypoint.sh /app/run_task.sh
 
 # 8. 使用我们的双进程启动脚本接管入口
 ENTRYPOINT ["/app/entrypoint.sh"]
