@@ -1,9 +1,6 @@
 services:
   ctyun-auto:
-    image: ctyun-auto:local-final-20261103
-    build:
-      context: ./app
-      dockerfile: Dockerfile
+    image: ghcr.io/wanyishao/ctyun-auto:latest
     container_name: ctyun-auto
     network_mode: "bridge"
     restart: on-failure
@@ -11,7 +8,6 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      - ./data/redeem_config.json:/app/redeem_config.json
     extra_hosts:
       - "deskcdn.ctyun.cn:106.120.187.154"
       - "deskcdn.ctyun.cn.ctadns.cn:106.120.187.154"

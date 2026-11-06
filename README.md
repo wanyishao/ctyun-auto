@@ -10,7 +10,6 @@
 - ⚙️ **动态配置**：使用环境变量灵活配置账号、密码以及 Cron 定时任务频率。
 - 🤖 **自动任务**：全自动执行 AI 对话积分任务与云电脑挂机积分任务。
 - ☁️ **多架构镜像**：GitHub Actions 自动构建并推送 `linux/amd64` 与 `linux/arm64` 镜像。
-- 🏷️ **版本镜像**：每次构建保留提交 SHA 标签；发布 `vX.Y.Z` 标签会生成对应版本和次版本标签。
 
 ## 🚀 快速开始
 
@@ -28,21 +27,16 @@ wget https://raw.githubusercontent.com/wanyishao/ctyun-auto/main/docker-compose.
 
 ```
 
-### 3. 修改配置
+### 3. 配置账号与任务时间
 
-使用您喜欢的编辑器打开 `docker-compose.yml`，修改 `environment` 下的环境变量，填入您的天翼云账号和密码：
+在 `docker-compose.yml` 同目录创建 `.env`，填入天翼云账号和密码。`.env` 只保存在服务器本地，不要提交到仓库：
 
-```yaml
-    environment:
-      - APP_USER=您的手机号
-      - APP_PASSWORD=您的密码
-      # 默认定时任务配置，可根据需要修改
-      - CRON_LOGIN=0 3,20 * * *
-      # AI 对话任务：每天 03:00 和 20:00 执行
-      - CRON_PC=0 4,6 * * *
-      # 挂机任务：每天 04:00 和 06:00 执行
-      - INIT_RUN=false
-      # 若设为 true，容器首次启动时会无视 cron 立即执行一次任务
+```dotenv
+APP_USER=您的手机号
+APP_PASSWORD=您的密码
+CRON_LOGIN=0 3,20 * * *
+CRON_PC=0 4,6 * * *
+INIT_RUN=false
 
 ```
 
@@ -51,23 +45,12 @@ wget https://raw.githubusercontent.com/wanyishao/ctyun-auto/main/docker-compose.
 直接在后台启动容器：
 
 ```bash
+docker-compose pull
 docker-compose up -d
 
 ```
 
 > **首次运行风控提醒**：如果账号触发了短信验证码风控，请通过 `docker logs -f ctyun_sign_auto` 查看日志，可能需要您暂时使用交互模式进入容器手动处理。
-
-### 镜像版本
-
-推送到 `main` 的代码会更新 `latest` 和 `sha-<提交短哈希>`。发布 Git 标签（例如 `v1.2.3`）会构建双架构镜像，并保留 `v1.2.3`、`1.2.3`、`1.2` 和提交 SHA 标签；发布版本也会更新 `latest`。部署时可以使用版本标签固定镜像，避免 `latest` 后续变化：
-
-```yaml
-services:
-  ctyun-auto:
-    image: ghcr.io/wanyishao/ctyun-auto:1.2.3
-```
-
-版本标签只会在对应的 GitHub Actions 构建成功后出现在 GHCR。本次只调整了本地 workflow 和文档，尚未推送或触发发布。
 
 ## 🛠️ 进阶操作与维护
 
