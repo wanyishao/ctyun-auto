@@ -39,7 +39,6 @@ wget https://raw.githubusercontent.com/wanyishao/ctyun-auto/main/docker-compose.
       CRON_PC: "0 4,6 * * *"
       PC_MAX_RUNTIME_SECONDS: "7200"
       INIT_RUN: "false"
-
 ```
 
 ### 4. 启动容器
@@ -49,7 +48,6 @@ wget https://raw.githubusercontent.com/wanyishao/ctyun-auto/main/docker-compose.
 ```bash
 docker-compose pull
 docker-compose up -d
-
 ```
 
 > **首次运行风控提醒**：如果账号触发了短信验证码风控，请通过 `docker logs -f ctyun_sign_auto` 查看日志，可能需要您暂时使用交互模式进入容器手动处理。
