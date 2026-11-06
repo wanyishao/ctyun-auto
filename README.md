@@ -29,14 +29,16 @@ wget https://raw.githubusercontent.com/wanyishao/ctyun-auto/main/docker-compose.
 
 ### 3. 配置账号与任务时间
 
-在 `docker-compose.yml` 同目录创建 `.env`，填入天翼云账号和密码。`.env` 只保存在服务器本地，不要提交到仓库：
+打开 `docker-compose.yml`，在 `environment` 中填写天翼云账号和密码，并按需调整任务时间：
 
-```dotenv
-APP_USER=您的手机号
-APP_PASSWORD=您的密码
-CRON_LOGIN=0 3,20 * * *
-CRON_PC=0 4,6 * * *
-INIT_RUN=false
+```yaml
+    environment:
+      APP_USER: "您的手机号"
+      APP_PASSWORD: "您的密码"
+      CRON_LOGIN: "0 3,20 * * *"
+      CRON_PC: "0 4,6 * * *"
+      PC_MAX_RUNTIME_SECONDS: "7200"
+      INIT_RUN: "false"
 
 ```
 

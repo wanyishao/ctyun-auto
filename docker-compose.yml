@@ -3,23 +3,20 @@ services:
     image: ghcr.io/wanyishao/ctyun-auto:latest
     container_name: ctyun-auto
     network_mode: "bridge"
-    restart: on-failure
-    env_file:
-      - .env
+    restart: unless-stopped
     volumes:
       - ./data:/app/data
     extra_hosts:
       - "deskcdn.ctyun.cn:106.120.187.154"
       - "deskcdn.ctyun.cn.ctadns.cn:106.120.187.154"
     environment:
+      APP_USER: "请替换为天翼云手机号"
+      APP_PASSWORD: "请替换为天翼云密码"
       RUNNING_IN_DOCKER: "true"
-      CRON_LOGIN: "${CRON_LOGIN:-0 3,20 * * *}"
-      # AI 对话任务：默认每天 03:00 和 20:00 执行。
-      CRON_PC: "${CRON_PC:-0 4,6 * * *}"
-      # 单次网页挂机最长运行时间（秒）；默认 7200。
-      PC_MAX_RUNTIME_SECONDS: "${PC_MAX_RUNTIME_SECONDS:-7200}"
-      # 默认关闭；在 .env 中设置 INIT_RUN=true 可启动时各执行一次。
-      INIT_RUN: "${INIT_RUN:-false}"
+      CRON_LOGIN: "0 3,20 * * *"
+      CRON_PC: "0 4,6 * * *"
+      PC_MAX_RUNTIME_SECONDS: "7200"
+      INIT_RUN: "false"
     logging:
       driver: "json-file"
       options:
