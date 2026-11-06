@@ -19,3 +19,11 @@ chrome_profile_*
 **/*.png
 *.jpg
 **/*.jpg
+
+# 本机测试、观察记录及生成缓存不进入 Docker 构建上下文。
+/local/
+/tests/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+**/.pytest_cache/

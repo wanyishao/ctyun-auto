@@ -10,6 +10,7 @@
 - ⚙️ **动态配置**：使用环境变量灵活配置账号、密码以及 Cron 定时任务频率。
 - 🤖 **自动任务**：全自动执行 AI 对话积分任务与云电脑挂机积分任务。
 - ☁️ **多架构镜像**：GitHub Actions 自动构建并推送 `linux/amd64` 与 `linux/arm64` 镜像。
+- 🏷️ **版本镜像**：每次构建保留提交 SHA 标签；发布 `vX.Y.Z` 标签会生成对应版本和次版本标签。
 
 ## 🚀 快速开始
 
@@ -56,6 +57,18 @@ docker-compose up -d
 
 > **首次运行风控提醒**：如果账号触发了短信验证码风控，请通过 `docker logs -f ctyun_sign_auto` 查看日志，可能需要您暂时使用交互模式进入容器手动处理。
 
+### 镜像版本
+
+推送到 `main` 的代码会更新 `latest` 和 `sha-<提交短哈希>`。发布 Git 标签（例如 `v1.2.3`）会构建双架构镜像，并保留 `v1.2.3`、`1.2.3`、`1.2` 和提交 SHA 标签；发布版本也会更新 `latest`。部署时可以使用版本标签固定镜像，避免 `latest` 后续变化：
+
+```yaml
+services:
+  ctyun-auto:
+    image: ghcr.io/wanyishao/ctyun-auto:1.2.3
+```
+
+版本标签只会在对应的 GitHub Actions 构建成功后出现在 GHCR。本次只调整了本地 workflow 和文档，尚未推送或触发发布。
+
 ## 🛠️ 进阶操作与维护
 
 ### 配置自动兑换奖励
@@ -63,12 +76,12 @@ docker-compose up -d
 容器正常运行后，如果您希望积攒的积分能自动兑换指定的云电脑配置时长或奖励，请在宿主机执行以下命令进入交互配置引导：
 
 ```bash
-docker exec -it ctyun-auto python3 /app/pc_login.py --config-redeem
+docker exec -it ctyun-auto /app/run_task.sh pc /usr/bin/python3 -u /app/pc_login.py --config-redeem
 
 ```
 
 根据终端提示，依次选择“要应用配置的设备”、“兑换的商品”以及“兑换策略”（推荐选择按每月特定日期兑换）。
-配置文件位于`/app/redeem_config.json`，默认不启用，若需要持久化自动兑换配置，在本地创建`redeem_config.json`文件，并修改`docker-compose.yml`文件，添加`- ./data/redeem_config.json:/app/redeem_config.json`。
+镜像已包含`/app/redeem_config.json`，默认内容为禁用自动兑换，因此容器首次启动不会缺少配置。若要在容器重建后保留交互配置，请在宿主机的`data`目录创建`redeem_config.json`，并在`docker-compose.yml`中启用可选挂载：
 
 ```yaml
     volumes:
@@ -97,19 +110,29 @@ docker-compose up -d
 
 ### 云电脑挂机与正在使用的客户端
 
-云电脑挂机任务需要通过网页连接桌面。若你正在使用其他云电脑客户端，可以在使用期间暂停自动挂机，避免两个客户端争用同一桌面会话：
+`CRON_PC` 配置的时间应是用户通常不使用客户端的空闲时段。任务统一经 `/app/run_task.sh` 启动：守护进程先完整停止 CtYun.dll 并写入授权确认，之后网页才允许建立远程桌面连接；网页任务、Chromium 和子进程退出后才恢复 DLL。客户端是否在线不通过积分进度推测。
+
+`PC_MAX_RUNTIME_SECONDS` 控制一次网页任务的最长运行时间，默认 7200 秒。人工维护暂停标记仍可选用：创建 `./data/.pause_pc_login` 可阻止新任务并请求正在运行的网页任务安全退出；维护完成后删除该文件即可恢复任务。没有标记时无需手动操作。
+
+自动挂机按 `CRON_PC` 配置的计划时间触发。将 `INIT_RUN=true` 可在容器启动时立即各执行一次 AI 对话和云电脑挂机；默认值为 `false`。Cron 和 `INIT_RUN` 触发的挂机遇到可信网络故障、挤占、`UNKNOWN` 断线或浏览器流程异常时，都会在关闭旧 Chromium、复查完成进度后最多重连 3 次，间隔 10、30、60 秒；重连时若进度 API 明确返回登录态过期，自动任务会在剩余重试预算内继续并由网页登录流程刷新会话。点击进入桌面后，若网页显示“正在重连”，先保留当前连接最多 45 秒，给网页自身恢复时间；仍无画布时再关闭旧浏览器并进入有限重试。自动模式的页面导航单次限制为 15 秒，桌面列表等待限制为 30 秒。手动任务只对可信桌面网络故障重连。仅服务端 `currentProgress >= 3600` 视为挂机完成，每次任务最长运行时间由 `PC_MAX_RUNTIME_SECONDS` 限制，默认 7200 秒。
+
+启动网页任务前会先用已保存的登录态查询 `currentProgress`；服务端已达到 `3600` 时直接处理现有积分兑换配置，不暂停 DLL 或启动浏览器。若任务进程身份、浏览器进程组或 DLL 停止状态无法确认，系统会保留 `active` 或 `data/.ctyun_dll_unsafe` 标记并拒绝新的连接。此类标记需要先检查对应进程确已退出，再由维护者清理；程序不会自行覆盖或解除 unsafe 状态。
+
+需要立即手动挂机时，使用与 Cron 相同的安全入口：
 
 ```bash
-touch ./data/.pause_pc_login
+docker exec -d ctyun-auto /app/run_task.sh pc /usr/bin/python3 -u /app/pc_login.py
 ```
 
-停止使用客户端后，删除该标记即可恢复后续定时任务：
+可查看任务窗口是否占用：
 
 ```bash
-rm ./data/.pause_pc_login
+docker exec ctyun-auto sh -c 'if [ -f /tmp/ctyun_pc_task_active ]; then echo "自动挂机运行中"; else echo "自动挂机未运行"; fi'
 ```
 
-一次挂机任务连接失败后只尝试一次，避免连续发起连接影响当前桌面会话。自动定时的 AI 对话与云电脑挂机任务会互斥运行。
+如果进程清理无法确认，守护进程会保持 DLL 停止并拒绝新的网页连接；此时先检查日志与进程，再由维护人员清理 `/tmp/ctyun_pc_task_active`。
+
+该状态只表示自动挂机进程，不代表用户客户端在线状态。Cron、手动挂机、`INIT_RUN` 和兑换配置入口共用任务锁与 DLL 交接。
 
 ## 📂 数据持久化说明
 
@@ -118,6 +141,8 @@ rm ./data/.pause_pc_login
 * `ctyun_authData_*.json` / `ctyun_cookies_*.json`：登录凭证缓存（避免频繁账密登录触发风控）。
 * `.devicecode_*`：设备标识码。
 * 错误时的截图留存（方便排查问题）。
+
+桌面断线诊断保存在 `data/desktop-diagnostics`：目录权限为 `0700`，文件权限为 `0600`；默认最多保留 40 个 JSON/截图文件，并在新诊断写入时清理超过 7 天的文件。可通过 `PC_DIAGNOSTIC_MAX_FILES` 和 `PC_DIAGNOSTIC_MAX_AGE_DAYS` 调整上限与保留期。
 
 请妥善保管 `data` 目录中的文件。
 

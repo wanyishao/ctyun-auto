@@ -1,4 +1,4 @@
-# Keep local runtime state and credentials out of the remote GHCR build context.
+# Keep local runtime state and credentials out of the Docker build context.
 data/
 **/data/
 .env
@@ -17,3 +17,39 @@ chrome_profile_*
 **/*.png
 *.jpg
 **/*.jpg
+!redeem_config.json
+
+# Keep the runtime image context limited to files copied by the Dockerfile.
+.git/
+.github/
+tests/
+test/
+**/tests/
+**/test/
+*.md
+**/*.md
+__pycache__/
+**/__pycache__/
+*.py[co]
+**/*.py[co]
+.venv/
+venv/
+env/
+**/.venv/
+**/venv/
+node_modules/
+**/node_modules/
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache
+.coverage
+.coverage.*
+*.log
+**/*.log
+*.swp
+*~
+.DS_Store
+Thumbs.db

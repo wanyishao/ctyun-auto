@@ -3,20 +3,37 @@
 """
 
 import argparse
-import atexit  # 新增导入 atexit 模块
 import calendar
 import datetime
+import hashlib
 import json
 import os
+import re
+import signal
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Dict, Optional
 
-import ddddocr
 import requests
 from DrissionPage import ChromiumOptions, ChromiumPage
+from desktop_diagnostics import (
+    CONNECTED,
+    DesktopCdpMonitor,
+    NETWORK_RECONNECT_DELAYS_SECONDS,
+    NETWORK_RETRYABLE,
+    PREEMPTED,
+    UNKNOWN,
+    classify_desktop_disconnect,
+    confirm_canvas_loss,
+    is_desktop_websocket_url,
+    next_network_reconnect_delay,
+    page_reports_reconnecting,
+    sanitize_url,
+)
+from task_progress import extract_current_progress, log_progress_change
+from task_processes import process_in_task_scope
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
@@ -24,7 +41,6 @@ sys.stderr.reconfigure(encoding="utf-8")
 LOGIN_URL = "https://pc.ctyun.cn/#/login"
 DESKTOP_URL = "https://pc.ctyun.cn/#/desktop-list"
 DESKTOP_DETAIL_URL_KEY = "/desktop?id="
-HANG_SECONDS = 80 * 60
 REWARD_LIST_URL = (
     "https://desk.ctyun.cn/selforder/api/selforder/prod/get"
     "?prodId=17000000&prodCode=POINTS"
@@ -33,8 +49,203 @@ PLACE_ORDER_URL = "https://desk.ctyun.cn/selforder/api/selforder/paas/placeOrder
 POINTS_TASK_LIST_URL = (
     "https://desk.ctyun.cn/selforder/api/marketing/userPoints/getTaskList"
 )
+USER_POINTS_URL = (
+    "https://desk.ctyun.cn/selforder/api/marketing/userPoints/getUserPoints"
+)
+TASK_PROGRESS_TARGET = 3600
+DEFAULT_PC_MAX_RUNTIME_SECONDS = 7200
+PC_CANVAS_LOSS_CONFIRMATIONS = 3
+DESKTOP_INITIAL_RECONNECT_GRACE_SECONDS = 45
+CTG_API_VERSION = "204000100"
+CTG_WEB_DEVICE_TYPE = "60"
+CTG_WEB_APP_MODEL = "2"
 RESTART_AT_FILE = "/tmp/ctyun_restart_at"
 MAX_DESKTOP_OPEN_ATTEMPTS = 1
+MAX_DESKTOP_NETWORK_RECONNECTS = len(NETWORK_RECONNECT_DELAYS_SECONDS)
+
+
+class AuthenticationExpiredError(RuntimeError):
+    """任务接口拒绝了已经过期的登录态。"""
+
+
+class DesktopConnectionFailure(RuntimeError):
+    """网页桌面断线分类及诊断已完成，需要退出当前浏览器会话。"""
+
+    def __init__(self, classification: str, diagnostic_path: Optional[str] = None):
+        super().__init__(classification)
+        self.classification = classification
+        self.diagnostic_path = diagnostic_path
+
+
+class PcMaxRuntimeExpired(RuntimeError):
+    """The configured safe runtime for one PC task has elapsed."""
+
+
+class PcTaskAuthorizationLost(RuntimeError):
+    """The wrapper no longer owns a valid DLL-to-browser handoff."""
+
+
+class BrowserCleanupFailure(RuntimeError):
+    """Chromium did not confirm orderly shutdown; reconnect is unsafe."""
+
+
+def get_pc_max_runtime_seconds() -> int:
+    raw_value = os.getenv("PC_MAX_RUNTIME_SECONDS", str(DEFAULT_PC_MAX_RUNTIME_SECONDS))
+    try:
+        value = int(raw_value)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    print(
+        "[!] PC_MAX_RUNTIME_SECONDS 必须是正整数；"
+        f"使用默认值 {DEFAULT_PC_MAX_RUNTIME_SECONDS} 秒。"
+    )
+    return DEFAULT_PC_MAX_RUNTIME_SECONDS
+
+
+def is_automatic_pc_trigger() -> bool:
+    """Cron and INIT_RUN may retry ambiguous/preemption desktop failures."""
+    return os.getenv("PC_AUTO_RETRY") == "1"
+
+
+def pc_navigation_options() -> Dict[str, int]:
+    """Keep scheduled page loads bounded so outer retries can make progress."""
+    if is_automatic_pc_trigger():
+        # DrissionPage retry counts are additional attempts; disable them here
+        # so the outer scheduled retry policy owns all reconnection attempts.
+        return {"timeout": 15, "retry": 0, "interval": 1}
+    return {"timeout": 30}
+
+
+def ensure_pc_runtime(deadline: Optional[float]) -> None:
+    if (
+        os.getenv("CTYUN_PC_TASK_AUTHORIZED") == "1"
+        and not pc_task_authorization_valid()
+    ):
+        raise PcTaskAuthorizationLost(
+            "挂机父任务或 DLL 交接授权已失效，正在关闭浏览器。"
+        )
+    if deadline is not None and time.monotonic() >= deadline:
+        raise PcMaxRuntimeExpired("网页挂机达到 PC_MAX_RUNTIME_SECONDS，安全退出。")
+
+
+def wait_for_task_child_processes(timeout_seconds: float = 10.0) -> None:
+    """Wait for live processes in this task's PGID or session, like task_guard.sh."""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return
+    task_pid = os.getpid()
+    task_pgid = os.getpgrp()
+    task_sid = os.getsid(task_pid)
+    browser_profile_root = os.getenv("CTYUN_PC_BROWSER_PROFILE_ROOT", "")
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = []
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit() or int(entry.name) == task_pid:
+                continue
+            try:
+                stat = (entry / "stat").read_text(encoding="utf-8")
+                cmdline = ""
+                if browser_profile_root:
+                    cmdline = (entry / "cmdline").read_bytes().replace(
+                        b"\0", b" "
+                    ).decode("utf-8", errors="replace")
+                if process_in_task_scope(
+                    stat, task_pgid, task_sid, cmdline, browser_profile_root
+                ):
+                    remaining.append(int(entry.name))
+            except (OSError, ValueError):
+                continue
+        if not remaining:
+            return
+        if time.monotonic() >= deadline:
+            raise BrowserCleanupFailure(
+                "Chromium 退出后仍有任务进程组/会话进程 "
+                f"{remaining[:8]}；禁止进入下一轮连接。"
+            )
+        time.sleep(0.1)
+
+
+def attach_desktop_cdp_monitor(page: ChromiumPage, monitor: DesktopCdpMonitor) -> bool:
+    """Subscribe to read-only CDP Network events before desktop navigation."""
+    try:
+        driver = getattr(page, "driver", None)
+        set_callback = getattr(driver, "set_callback", None)
+        if not callable(set_callback):
+            print("[!] DrissionPage 未提供原始 CDP 事件回调，继续使用页面状态诊断。")
+            return False
+
+        for method in monitor.EVENT_METHODS:
+            def callback(_method=method, **params):
+                monitor.record(_method, **params)
+
+            set_callback(method, callback)
+        page.run_cdp("Network.enable")
+        print("[*] 已启用只读 CDP WebSocket/网络事件监听。")
+        return True
+    except Exception as error:
+        print(f"[!] 无法启用 CDP 网络事件监听：{error}")
+        return False
+
+
+def get_pc_pause_file(running_in_docker: bool) -> str:
+    """获取人工暂停云电脑任务的标记文件路径。"""
+    return os.getenv(
+        "PC_TASK_PAUSE_FILE",
+        "/app/data/.pause_pc_login" if running_in_docker else "./.pause_pc_login",
+    )
+
+
+def pc_task_pause_requested(running_in_docker: bool) -> bool:
+    return os.path.exists(get_pc_pause_file(running_in_docker))
+
+
+def pc_task_authorization_valid() -> bool:
+    """Require a live wrapper, matching task process group, and DLL handoff ack."""
+    if os.getenv("CTYUN_PC_TASK_AUTHORIZED") != "1":
+        return False
+    owner_pid = str(os.getppid())
+    active_file = os.getenv("PC_TASK_ACTIVE_FILE", "/tmp/ctyun_pc_task_active")
+    dll_ack_file = os.getenv("PC_DLL_STOPPED_FILE", "/tmp/ctyun_dll_stopped")
+    dll_unsafe_file = os.getenv("PC_DLL_UNSAFE_FILE", "/app/data/.ctyun_dll_unsafe")
+
+    def read_fields(path: str) -> dict:
+        values = {}
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key] = value
+        return values
+
+    def process_start_ticks(pid: int) -> Optional[str]:
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            fields = stat_line[stat_line.rfind(")") + 2 :].split()
+            return fields[19] if len(fields) >= 20 else None
+        except (OSError, ValueError):
+            return None
+
+    try:
+        if Path(dll_unsafe_file).exists():
+            return False
+        marker = read_fields(active_file)
+        ack = read_fields(dll_ack_file)
+        owner_start = marker.get("owner_start", "")
+        parent_start = process_start_ticks(os.getppid())
+        return bool(
+            marker.get("state") == "running"
+            and marker.get("owner_pid") == owner_pid
+            and owner_start
+            and owner_start == parent_start
+            and marker.get("task_pgid", "").isdigit()
+            and int(marker["task_pgid"]) == os.getpgrp()
+            and ack.get("owner_pid") == owner_pid
+            and ack.get("task_pgid") == marker.get("task_pgid")
+        )
+    except (OSError, ValueError, KeyError):
+        return False
 
 
 def init_browser_options(running_in_docker: bool) -> ChromiumOptions:
@@ -44,6 +255,11 @@ def init_browser_options(running_in_docker: bool) -> ChromiumOptions:
     options.set_argument("--disable-gpu")
     options.set_argument("--disable-dev-shm-usage")
     options.set_argument("--window-size=1920,1080")
+    browser_profile = os.getenv("CTYUN_PC_BROWSER_PROFILE")
+    if browser_profile:
+        profile_path = Path(browser_profile)
+        profile_path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        options.set_user_data_path(str(profile_path))
     if running_in_docker:
         options.headless()
     return options
@@ -119,6 +335,20 @@ def set_web_device_code(page: ChromiumPage, device_code: str) -> None:
     print("[*] 已写入 localStorage.web_device_code")
 
 
+def read_page_device_code(page: ChromiumPage, fallback: str) -> str:
+    """Use the device code retained by the authenticated browser session."""
+    try:
+        value = page.run_js("return localStorage.getItem('web_device_code') || ''; ")
+    except Exception:
+        return fallback
+    if not isinstance(value, str) or not value.strip():
+        return fallback
+    value = value.strip()
+    if value != fallback:
+        print("[*] 网页登录后设备标识已变化；进度 API 将使用当前页面标识。")
+    return value
+
+
 def get_auth_expired_at_ms(hours: int = 72) -> int:
     """生成 authExpiredAt 时间戳（毫秒）。"""
     return int((time.time() + hours * 3600) * 1000)
@@ -155,7 +385,12 @@ def first_available(page: ChromiumPage, selectors: list[str], timeout: float = 2
     return None
 
 
-def fill_credentials(page: ChromiumPage, username: str, password: str) -> None:
+def fill_credentials(
+    page: ChromiumPage,
+    username: str,
+    password: str,
+    selector_timeout: float = 60,
+) -> None:
     """填写账号与密码。"""
     account_input = first_available(
         page,
@@ -164,7 +399,7 @@ def fill_credentials(page: ChromiumPage, username: str, password: str) -> None:
             'css:input[placeholder*="账号"]',
             'css:input[type="text"]',
         ],
-        timeout=60,
+        timeout=selector_timeout,
     )
     password_input = first_available(
         page,
@@ -172,7 +407,7 @@ def fill_credentials(page: ChromiumPage, username: str, password: str) -> None:
             'css:input[placeholder*="密码"]',
             'css:input[type="password"]',
         ],
-        timeout=10,
+        timeout=min(10, selector_timeout),
     )
 
     if not account_input or not password_input:
@@ -262,11 +497,33 @@ def read_auth_data(page: ChromiumPage) -> dict:
     return {}
 
 
+def get_current_page_url(page: ChromiumPage) -> str:
+    """Read the SPA URL without DrissionPage's implicit doc-loaded wait."""
+    try:
+        value = page.run_js("return window.location.href;", timeout=3)
+        if isinstance(value, str) and value:
+            return value
+    except Exception:
+        pass
+    try:
+        target_id = getattr(page, "_target_id", None)
+        if target_id:
+            result = page.run_cdp("Target.getTargetInfo", targetId=target_id)
+            target_info = result.get("targetInfo", {}) if isinstance(result, dict) else {}
+            value = target_info.get("url", "")
+            if isinstance(value, str):
+                return value
+    except Exception:
+        pass
+    return str(getattr(page, "_url", "") or "")
+
+
 def is_login_success(page: ChromiumPage) -> bool:
     """判断是否已登录成功。"""
-    if DESKTOP_URL in page.url or "/desktop-list" in page.url:
+    current_url = get_current_page_url(page)
+    if DESKTOP_URL in current_url or "/desktop-list" in current_url:
         return True
-    if "/login" in page.url:
+    if "/login" in current_url:
         return False
     time.sleep(1)
     auth_data = read_auth_data(page)
@@ -278,7 +535,7 @@ def wait_desktop_list_refresh_done(page: ChromiumPage, timeout: int = 60) -> Non
     end_time = time.time() + timeout
     seen_loading = False
     while time.time() < end_time:
-        current_url = page.url or ""
+        current_url = get_current_page_url(page)
         date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"\r[*] {date} 页面状态检测中...", end="")
         if "/login" in current_url or DESKTOP_DETAIL_URL_KEY in current_url:
@@ -307,8 +564,8 @@ def wait_desktop_list_refresh_done(page: ChromiumPage, timeout: int = 60) -> Non
 
 def get_desktop_state(page: ChromiumPage) -> str:
     """识别 desktop-list 的状态。"""
-    current_url = page.url or ""
-    if DESKTOP_DETAIL_URL_KEY in current_url:
+    current_url = get_current_page_url(page)
+    if is_desktop_detail_url(current_url):
         return "desktop_entered_auto"
     if "/login" in current_url:
         return "auth_expired"
@@ -332,6 +589,14 @@ def get_desktop_state(page: ChromiumPage) -> str:
     if has_cloud_phone:
         return "only_phone"
     return "unknown"
+
+
+def is_desktop_detail_url(url: str) -> bool:
+    """兼容旧版 /desktop?id= 和新版 Vue hash 路由 #/desktop。"""
+    if DESKTOP_DETAIL_URL_KEY in (url or ""):
+        return True
+    route = (url or "").partition("#")[2].split("?", 1)[0].rstrip("/")
+    return route == "/desktop" or route.startswith("/desktop/")
 
 
 def click_enter_ai_pc(page: ChromiumPage) -> bool:
@@ -369,6 +634,23 @@ def click_visible_text(page: ChromiumPage, text: str) -> bool:
         return False
 
 
+def click_control_center_icon(page: ChromiumPage) -> bool:
+    """点击新版工具栏中仅有 title、没有可见文字的控制中心图标。"""
+    try:
+        return bool(
+            page.run_js(
+                """const element = Array.from(document.querySelectorAll('[title]'))
+                    .find(item => item.getAttribute('title') === '控制中心'
+                        && item.getClientRects().length);
+                if (!element) return false;
+                element.click();
+                return true;"""
+            )
+        )
+    except Exception:
+        return False
+
+
 def get_points_page_hints(page: ChromiumPage) -> str:
     """提取与连接状态和积分入口相关的可见页面文字。"""
     try:
@@ -390,68 +672,362 @@ def get_desktop_page_text(page: ChromiumPage) -> str:
     """读取云电脑页面可见文字，用于判断连接状态。"""
     try:
         value = page.run_js(
-            "return document.body ? document.body.innerText : '';"
+            "return document.body ? document.body.innerText : '';", timeout=3
         )
         return str(value or "")
     except Exception:
         return ""
 
 
-def wait_desktop_opened(page: ChromiumPage, timeout: int = 270) -> bool:
-    """等待云电脑连接完成，而不只等待 URL 切换。"""
-    end_time = time.time() + timeout
-    ready_markers = (
-        "控制中心",
-        "积分中心",
-        "快捷应用",
-        "网络时延",
-        "家庭管理",
-        "安全中心",
-    )
-    connecting_markers = (
-        "正在通过加密通道进行连接",
-        "正在为您连接AI云电脑",
-        "正在为您重连",
-        "连接已断开",
-    )
-    while time.time() < end_time:
-        current_url = page.url or ""
-        if "/login" in current_url:
-            return False
+def get_desktop_canvas_state(page: ChromiumPage) -> dict:
+    """读取远程桌面画布和工具栏的可见状态。"""
+    try:
+        value = page.run_js(
+            """const canvas = document.querySelector('canvas.canvas.pixelated');
+            const bounds = canvas ? canvas.getBoundingClientRect() : null;
+            const titles = Array.from(document.querySelectorAll('[title]'))
+                .map(element => element.getAttribute('title'));
+            const toolbarCount = ['控制中心', '网络状态', '全屏']
+                .filter(title => titles.includes(title)).length;
+            const width = bounds ? Math.round(bounds.width) : 0;
+            const height = bounds ? Math.round(bounds.height) : 0;
+            return {
+                present: !!canvas,
+                width,
+                height,
+                toolbar_count: toolbarCount,
+                connected: !!canvas && width >= 640 && height >= 360
+                    && toolbarCount >= 2
+            };""",
+            timeout=3,
+        )
+        if isinstance(value, dict):
+            return value
+        return {"present": bool(value), "connected": bool(value)}
+    except Exception as error:
+        return {"present": False, "connected": False, "error": str(error)[:300]}
 
-        if DESKTOP_DETAIL_URL_KEY in current_url:
-            page_text = get_desktop_page_text(page)
-            if "连接AI云电脑超时" in page_text or "连接超时" in page_text:
-                print("[!] 页面报告云电脑连接超时。")
-                return False
-            if any(marker in page_text for marker in connecting_markers):
-                time.sleep(1)
+
+_diagnostic_cleanup_lock = threading.Lock()
+
+
+def prune_desktop_diagnostics(
+    directory: Path, max_files: int, max_age_days: int
+) -> None:
+    """Bound diagnostic storage after asynchronous screenshot writes finish."""
+    expiration = time.time() - max_age_days * 86400
+    with _diagnostic_cleanup_lock:
+        diagnostic_files = []
+        for path in directory.glob("desktop-disconnect-*"):
+            if path.suffix not in {".json", ".png"} or not path.is_file():
                 continue
-            if any(marker in page_text for marker in ready_markers):
-                return True
-        time.sleep(0.5)
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                continue
+            if modified < expiration:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            diagnostic_files.append((modified, path))
+
+        diagnostic_files.sort(key=lambda item: item[0])
+        excess = max(0, len(diagnostic_files) - max_files)
+        for _, path in diagnostic_files[:excess]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def save_desktop_disconnect_diagnostic(
+    page: ChromiumPage,
+    monitor: Optional[DesktopCdpMonitor],
+    classification: str,
+    reason: str,
+    running_in_docker: bool,
+) -> Optional[str]:
+    """Write a private diagnostic immediately; screenshot capture is best effort."""
+    now = datetime.datetime.now().astimezone()
+    file_stamp = now.strftime("%Y%m%dT%H%M%S_%f")
+    directory = Path(
+        "/app/data/desktop-diagnostics"
+        if running_in_docker
+        else "./data/desktop-diagnostics"
+    )
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+    except OSError as error:
+        print(f"[!] 无法创建断线诊断目录：{error}")
+        return None
+
+    try:
+        max_files = max(4, min(200, int(os.getenv("PC_DIAGNOSTIC_MAX_FILES", "40"))))
+    except ValueError:
+        max_files = 40
+    try:
+        max_age_days = max(1, min(90, int(os.getenv("PC_DIAGNOSTIC_MAX_AGE_DAYS", "7"))))
+    except ValueError:
+        max_age_days = 7
+    prune_desktop_diagnostics(directory, max_files, max_age_days)
+
+    try:
+        page_url = sanitize_url(get_current_page_url(page))
+    except Exception:
+        page_url = "<unavailable>"
+    try:
+        page_text = get_desktop_page_text(page)
+    except Exception:
+        page_text = ""
+    hints = get_points_page_hints(page)
+    page_text = re.sub(r"(?<!\d)\d{11}(?!\d)", "[账号已隐藏]", page_text)
+    hints = re.sub(r"(?<!\d)\d{11}(?!\d)", "[账号已隐藏]", hints)
+    canvas_state = get_desktop_canvas_state(page)
+    network_events = monitor.snapshot() if monitor else []
+    screenshot_path = directory / f"desktop-disconnect-{file_stamp}.png"
+    diagnostic_path = directory / f"desktop-disconnect-{file_stamp}.json"
+    diagnostic = {
+        "timestamp": now.isoformat(timespec="milliseconds"),
+        "classification": classification,
+        "reason": reason,
+        "url": page_url,
+        "page_hints": hints,
+        "page_text_excerpt": page_text[:1500],
+        "canvas": canvas_state,
+        "network_events": network_events,
+        "screenshot": str(screenshot_path),
+        "screenshot_status": "best_effort_async",
+    }
+    try:
+        descriptor = os.open(
+            diagnostic_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(json.dumps(diagnostic, ensure_ascii=False, indent=2))
+        os.chmod(diagnostic_path, 0o600)
+        prune_desktop_diagnostics(directory, max_files, max_age_days)
+    except OSError as error:
+        print(f"[!] 无法写入断线诊断 JSON：{error}")
+        return None
+
+    def capture_screenshot() -> None:
+        try:
+            page.get_screenshot(
+                path=str(directory),
+                name=f"desktop-disconnect-{file_stamp}",
+                full_page=True,
+            )
+            if screenshot_path.exists():
+                os.chmod(screenshot_path, 0o600)
+                if screenshot_path.stat().st_size > 4 * 1024 * 1024:
+                    screenshot_path.unlink()
+                    print("[!] 断线截图超过 4 MiB，已删除。")
+            prune_desktop_diagnostics(directory, max_files, max_age_days)
+        except Exception as error:
+            print(f"[!] 后台断线截图未能完成（不影响连接释放）：{error}")
+
+    threading.Thread(
+        target=capture_screenshot,
+        name="ctyun-disconnect-screenshot",
+        daemon=True,
+    ).start()
+    print(f"[*] 断线诊断已保存：{diagnostic_path}")
+    print(f"[*] 已异步请求断线截图：{screenshot_path}")
+    return str(diagnostic_path)
+
+
+def wait_desktop_opened(
+    page: ChromiumPage,
+    timeout: int = 270,
+    pause_file: Optional[str] = None,
+    monitor: Optional[DesktopCdpMonitor] = None,
+    running_in_docker: bool = False,
+    runtime_deadline: Optional[float] = None,
+) -> str:
+    """Wait for the canvas and classify a failed desktop connection."""
+    remaining = max(0, runtime_deadline - time.monotonic()) if runtime_deadline else timeout
+    end_time = time.time() + min(timeout, remaining)
+    reconnect_deadline: Optional[float] = None
+    while time.time() < end_time:
+        ensure_pc_runtime(runtime_deadline)
+        if pause_file and os.path.exists(pause_file):
+            print("[*] 检测到人工暂停标记，停止等待桌面连接。")
+            return UNKNOWN
+
+        current_url = get_current_page_url(page)
+        if "/login" in current_url:
+            path = save_desktop_disconnect_diagnostic(
+                page,
+                monitor,
+                UNKNOWN,
+                "等待桌面画布期间页面被重定向到登录页",
+                running_in_docker,
+            )
+            raise DesktopConnectionFailure(UNKNOWN, path)
+
+        if is_desktop_detail_url(current_url):
+            page_text = get_desktop_page_text(page)
+            canvas_state = get_desktop_canvas_state(page)
+            canvas_present = bool(canvas_state.get("connected"))
+            if canvas_present:
+                if monitor:
+                    monitor.mark_canvas_connected()
+                print("[*] 已检测到云电脑远程桌面画布。")
+                return CONNECTED
+
+            network_events = monitor.events_for_classification() if monitor else []
+            classification = classify_desktop_disconnect(
+                page_text=page_text,
+                canvas_present=False,
+                network_events=network_events,
+            )
+            # A conflict prompt or confirmed desktop-tunnel transport failure
+            # is actionable immediately. Generic close events are handled as
+            # UNKNOWN below so the website cannot keep reconnecting itself.
+            if classification in {PREEMPTED, NETWORK_RETRYABLE}:
+                reason = (
+                    "页面出现明确的账号/会话冲突提示"
+                    if classification == PREEMPTED
+                    else "CDP 或页面提示确认了桌面连接网络故障"
+                )
+                path = save_desktop_disconnect_diagnostic(
+                    page, monitor, classification, reason, running_in_docker
+                )
+                print(f"[!] 网页桌面断线分类：{classification}。")
+                if classification == PREEMPTED:
+                    if is_automatic_pc_trigger():
+                        print("[!] 检测到客户端连接冲突，关闭当前网页后由自动任务有限重试。")
+                    else:
+                        print("[!] 检测到客户端连接冲突，立即退出，不再重连。")
+                raise DesktopConnectionFailure(classification, path)
+
+            if page_reports_reconnecting(page_text) and reconnect_deadline is None:
+                reconnect_deadline = (
+                    time.monotonic() + DESKTOP_INITIAL_RECONNECT_GRACE_SECONDS
+                )
+                print(
+                    "[*] 网页正在自动恢复初始桌面连接；保留当前会话最多 "
+                    f"{DESKTOP_INITIAL_RECONNECT_GRACE_SECONDS} 秒并持续检测画布。"
+                )
+
+            observed_generic_close = any(
+                event.get("desktop_connection")
+                and (
+                    event.get("event") == "Network.webSocketClosed"
+                    or (
+                        event.get("event") == "Network.webSocketFrameReceived"
+                        and event.get("opcode") == 8
+                    )
+                )
+                for event in network_events
+            )
+            if (
+                classification == UNKNOWN
+                and observed_generic_close
+                and reconnect_deadline is None
+            ):
+                reason = (
+                    "当前桌面 WebSocket 已关闭但没有明确 close 原因或冲突提示；"
+                    "按 UNKNOWN 停止网页自身自动重连"
+                )
+                path = save_desktop_disconnect_diagnostic(
+                    page, monitor, UNKNOWN, reason, running_in_docker
+                )
+                if is_automatic_pc_trigger():
+                    print("[!] 仅观察到通用 WebSocket 关闭，关闭当前网页后由自动任务有限重试。")
+                else:
+                    print("[!] 仅观察到通用 WebSocket 关闭，分类为 UNKNOWN，立即退出。")
+                raise DesktopConnectionFailure(UNKNOWN, path)
+
+            if reconnect_deadline is not None:
+                grace_remaining = reconnect_deadline - time.monotonic()
+                if grace_remaining > 0:
+                    time.sleep(min(0.5, grace_remaining))
+                    continue
+                reason = (
+                    "网页自动恢复初始桌面连接超过 "
+                    f"{DESKTOP_INITIAL_RECONNECT_GRACE_SECONDS} 秒；"
+                    "画布仍未出现，且没有明确冲突或桌面网络证据"
+                )
+                path = save_desktop_disconnect_diagnostic(
+                    page, monitor, UNKNOWN, reason, running_in_docker
+                )
+                if is_automatic_pc_trigger():
+                    print("[!] 初始桌面连接恢复等待超时，关闭当前网页后由自动任务有限重试。")
+                else:
+                    print("[!] 初始桌面连接恢复等待超时，分类为 UNKNOWN，保守退出。")
+                raise DesktopConnectionFailure(UNKNOWN, path)
+        time.sleep(min(0.5, max(0.05, end_time - time.time())))
+
+    ensure_pc_runtime(runtime_deadline)
     print("[*] 等待云电脑连接完成超时。")
-    print(f"[-] 页面状态: {get_points_page_hints(page)}")
-    return False
+    page_text = get_desktop_page_text(page)
+    classification = classify_desktop_disconnect(
+        page_text=page_text,
+        canvas_present=False,
+        network_events=monitor.events_for_classification() if monitor else [],
+    )
+    reason = "连接等待超时；没有画布且没有可确认的桌面网络故障"
+    if classification == NETWORK_RETRYABLE:
+        reason = "CDP/页面提示确认桌面 DNS/TCP/socket/timeout 故障"
+    elif classification == PREEMPTED:
+        reason = "页面出现明确的账号/会话冲突提示"
+    path = save_desktop_disconnect_diagnostic(
+        page, monitor, classification, reason, running_in_docker
+    )
+    print(f"[!] 网页桌面断线分类：{classification}。")
+    if classification == PREEMPTED:
+        if is_automatic_pc_trigger():
+            print("[!] 检测到客户端连接冲突，关闭当前网页后由自动任务有限重试。")
+        else:
+            print("[!] 检测到客户端连接冲突，立即退出，不再重连。")
+    elif classification == UNKNOWN:
+        if is_automatic_pc_trigger():
+            print("[!] 画布未建立且没有明确故障证据，关闭当前网页后由自动任务有限重试。")
+        else:
+            print("[!] 画布未建立且没有明确故障证据，分类为 UNKNOWN，立即退出。")
+    raise DesktopConnectionFailure(classification, path)
 
 
-def open_points_center_and_print(page: ChromiumPage, timeout: int = 60) -> int:
+def has_connected_desktop_canvas(page: ChromiumPage) -> bool:
+    """检查新版远程桌面画布和工具栏是否都已加载。"""
+    return bool(get_desktop_canvas_state(page).get("connected"))
+
+
+def open_points_center_and_print(
+    page: ChromiumPage,
+    timeout: int = 60,
+    pause_file: Optional[str] = None,
+    runtime_deadline: Optional[float] = None,
+    entry_timeout: int = 120,
+) -> Optional[int]:
     """打开积分中心并输出积分详情。"""
     try:
+        if pause_file and os.path.exists(pause_file):
+            print("[*] 检测到人工暂停标记，取消打开积分中心。")
+            return None
         clicked = click_visible_text(page, "积分中心")
         if not clicked:
             # 工具栏可能在进入云电脑后延迟加载；最多等待 120 秒。
-            end_time = time.time() + 120
+            end_time = time.time() + entry_timeout
             control_center_opened = False
             while time.time() < end_time:
+                if pause_file and os.path.exists(pause_file):
+                    print("[*] 检测到人工暂停标记，取消打开积分中心。")
+                    return None
+                if runtime_deadline is not None and time.monotonic() >= runtime_deadline:
+                    return None
                 if click_visible_text(page, "积分中心"):
                     clicked = True
                     break
 
                 # 新版工具栏将积分中心收在“控制中心”面板内。
-                if not control_center_opened and click_visible_text(
-                    page, "控制中心"
-                ):
+                if not control_center_opened and click_control_center_icon(page):
                     control_center_opened = True
                     end_time = time.time() + 15
                     continue
@@ -462,29 +1038,61 @@ def open_points_center_and_print(page: ChromiumPage, timeout: int = 60) -> int:
                 "\r[-] 未找到积分中心入口。"
                 f" 页面提示: {get_points_page_hints(page)}"
             )
-            return 0
-        time.sleep(5)
-        end_time = time.time() + timeout
+            return None
+        initial_wait = (
+            min(5, max(0, runtime_deadline - time.monotonic()))
+            if runtime_deadline
+            else 5
+        )
+        time.sleep(initial_wait)
+        end_time = time.time() + min(
+            timeout,
+            max(0, runtime_deadline - time.monotonic()) if runtime_deadline else timeout,
+        )
         while time.time() < end_time:
+            if pause_file and os.path.exists(pause_file):
+                print("[*] 检测到人工暂停标记，停止等待积分中心。")
+                return None
+            if runtime_deadline is not None and time.monotonic() >= runtime_deadline:
+                return None
             if page.ele('css:iframe[src*="points.html"]', timeout=0.5):
                 break
             time.sleep(0.3)
 
-        iframe_ele = page.ele('css:iframe[src*="points.html"]', timeout=30)
+        iframe_ele = page.ele('css:iframe[src*="points.html"]', timeout=1)
         if not iframe_ele:
             print("\r[-] 未找到积分中心 iframe。")
-            return 0
+            return None
 
         frame = page.get_frame(iframe_ele)
         if not frame:
             print("\r[-] 无法切换到积分中心 iframe。")
-            return 0
+            return None
 
-        time.sleep(5)
+        frame_wait = (
+            min(5, max(0, runtime_deadline - time.monotonic()))
+            if runtime_deadline
+            else 5
+        )
+        time.sleep(frame_wait)
         general_points = ""
-        try:
-            root_element = frame.ele("tag:div@class:points-list", timeout=60)
-        except Exception:
+        root_element = None
+        root_end_time = time.time() + min(
+            60,
+            max(0, runtime_deadline - time.monotonic()) if runtime_deadline else 60,
+        )
+        while time.time() < root_end_time and not root_element:
+            if pause_file and os.path.exists(pause_file):
+                print("[*] 检测到人工暂停标记，停止读取积分中心。")
+                return None
+            if runtime_deadline is not None and time.monotonic() >= runtime_deadline:
+                return None
+            try:
+                root_element = frame.ele("tag:div@class:points-list", timeout=1)
+            except Exception:
+                time.sleep(0.2)
+
+        if not root_element:
             print("[*] 积分中心页面加载过久")
 
         if root_element:
@@ -508,62 +1116,212 @@ def open_points_center_and_print(page: ChromiumPage, timeout: int = 60) -> int:
 
         if not general_points:
             print("\r[-] 未读取到通用积分。")
-            return 0
+            return None
 
         print(f"\r[*] 目前积分: {general_points}")
         return int(general_points)
     except Exception as e:
         print(f"[-] 无法获取积分中心数据：{e}")
-        return 0
+        return None
+
+
+def capture_page_task_api_request(
+    page: ChromiumPage,
+    pause_file: str,
+    runtime_deadline: Optional[float],
+    timeout: int = 12,
+) -> tuple[Optional[Dict[str, str]], Optional[int]]:
+    """Capture the page's own read-only task API request after auth rejection."""
+    try:
+        page.listen.start(POINTS_TASK_LIST_URL)
+    except Exception as error:
+        print(f"[!] 无法监听网页任务 API 请求：{type(error).__name__}")
+        return None, None
+
+    open_points_center_and_print(
+        page,
+        timeout=min(15, timeout),
+        pause_file=pause_file,
+        runtime_deadline=runtime_deadline,
+        entry_timeout=20 if is_automatic_pc_trigger() else 120,
+    )
+
+    end_time = time.monotonic() + timeout
+    packet = None
+    while time.monotonic() < end_time:
+        ensure_pc_runtime(runtime_deadline)
+        if os.path.exists(pause_file):
+            print("[*] 捕获任务 API 请求时检测到维护暂停，停止等待。")
+            return None, None
+        try:
+            packet = page.listen.wait(timeout=min(1, max(0.1, end_time - time.monotonic())))
+        except Exception:
+            packet = None
+        if packet:
+            break
+
+    if not packet:
+        print("[!] 积分中心未产生可捕获的任务 API 请求。")
+        return None, None
+
+    try:
+        headers = clean_headers(packet.request.headers)
+    except Exception:
+        headers = None
+
+    progress = None
+    try:
+        body = packet.response.body
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", errors="replace")
+        if isinstance(body, str):
+            body = json.loads(body)
+        progress = extract_current_progress(body)
+    except Exception:
+        progress = None
+
+    if headers:
+        print("[*] 已捕获网页自身生成的任务 API 请求头（不记录敏感值）。")
+    if progress is not None:
+        print(f"[*] 积分中心返回 currentProgress: {progress}/{TASK_PROGRESS_TARGET}")
+    return headers, progress
 
 
 def wait_for_points_with_points(
     page: ChromiumPage,
-    total_seconds: int = HANG_SECONDS,
     step: int = 10,
     running_in_docker: bool = False,
     config_redeem_only: bool = False,
+    device_code: Optional[str] = None,
+    monitor: Optional[DesktopCdpMonitor] = None,
+    runtime_deadline: Optional[float] = None,
+    task_auth_data: Optional[dict] = None,
 ) -> None:
     """进入云电脑后挂机等待积分，结束前打印积分详情。"""
     print("[*] 已进入云电脑")
-    remaining = total_seconds
-    # 超时时间
-    max_time = 360
-    refresh_retry_count_max = 13
-    last_progress = 0
-    packet_retry_count = 0
-    refresh_retry_count = 0
-    last_progress_update_time = time.time()
+    next_api_poll_at = 0.0
     redeem_config_checked = False
-    url = "https://desk.ctyun.cn/selforder/api/marketing/userPoints/getTaskList"
-    # 初始状态开启监听和界面
-    page.listen.start(url)
-    current_points = open_points_center_and_print(page)
-    packet = page.listen.wait(timeout=20)
-    while remaining > 0:
-        # 开始挂机，获取积分中心数据，然后无限循环，并获取网络数据包判断是否完成挂机
+    current_points: Optional[int] = None
+    last_progress: Optional[int] = None
+    canvas_missing_count = 0
+    captured_api_headers: Optional[Dict[str, str]] = None
+    url = POINTS_TASK_LIST_URL
+    pause_file = get_pc_pause_file(running_in_docker)
+    request_device_code = device_code or get_device_code(
+        os.getenv("APP_USER") or "", running_in_docker
+    )
+    api_auth_data = (
+        task_auth_data if isinstance(task_auth_data, dict) else read_auth_data(page)
+    )
+    api_auth_source = "prechecked" if task_auth_data is not None else "page"
+    if pc_task_pause_requested(running_in_docker):
+        print("[*] 检测到人工暂停标记，安全断开当前挂机会话。")
+        sys.exit(0)
+
+    while True:
+        ensure_pc_runtime(runtime_deadline)
+        if pc_task_pause_requested(running_in_docker):
+            print("[*] 检测到人工暂停标记，安全断开当前挂机会话。")
+            sys.exit(0)
+
         current_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if not packet:
-            packet_retry_count += 1
-            print(
-                f"\r[-] {current_time_str} 未捕获到积分数据包，正在重试 ({packet_retry_count}/6)"
+        if monitor:
+            page_text = get_desktop_page_text(page)
+            canvas_present = has_connected_desktop_canvas(page)
+            classification = classify_desktop_disconnect(
+                page_text=page_text,
+                canvas_present=canvas_present,
+                network_events=monitor.events_for_classification(
+                    since_canvas_connected=True
+                ),
             )
-            time.sleep(10)
+            if classification != CONNECTED:
+                loss_confirmed, canvas_missing_count = confirm_canvas_loss(
+                    classification,
+                    canvas_missing_count,
+                    PC_CANVAS_LOSS_CONFIRMATIONS,
+                )
+                if not loss_confirmed:
+                    print(
+                        "[*] 远程桌面画布短暂不可见，等待连续确认 "
+                        f"({canvas_missing_count}/{PC_CANVAS_LOSS_CONFIRMATIONS})。"
+                    )
+                    time.sleep(1)
+                    continue
+                reason = (
+                    "页面出现明确的账号/会话冲突提示"
+                    if classification == PREEMPTED
+                    else "已连接期间桌面画布消失，且 CDP 未证明该故障属于桌面网络连接"
+                )
+                if classification == NETWORK_RETRYABLE:
+                    reason = "已连接期间 CDP 确认桌面 WebSocket DNS/TCP/socket/timeout 故障"
+                diagnostic_path = save_desktop_disconnect_diagnostic(
+                    page,
+                    monitor,
+                    classification,
+                    reason,
+                    running_in_docker,
+                )
+                if classification == PREEMPTED:
+                    if is_automatic_pc_trigger():
+                        print("[!] 检测到客户端连接冲突，关闭当前网页后由自动任务有限重试。")
+                    else:
+                        print("[!] 检测到客户端连接冲突，立即退出，不再重连。")
+                elif classification == UNKNOWN:
+                    if is_automatic_pc_trigger():
+                        print("[!] 画布消失且没有明确故障证据，关闭当前网页后由自动任务有限重试。")
+                    else:
+                        print("[!] 画布消失但没有明确故障证据，分类为 UNKNOWN，保守退出。")
+                raise DesktopConnectionFailure(classification, diagnostic_path)
+            canvas_missing_count = 0
 
-            if packet_retry_count >= 6:
-                print(f"[-] {current_time_str} 连续 6 次未捕获到数据包，程序终止。")
-                sys.exit(1)
-
-            page.refresh()
-            time.sleep(5)
-            page.listen.start(url)
-            current_points = open_points_center_and_print(page)
-            packet = page.listen.wait(timeout=20)
+        now_monotonic = time.monotonic()
+        if now_monotonic < next_api_poll_at:
+            time.sleep(min(1.0, max(0.1, next_api_poll_at - now_monotonic)))
             continue
 
-        # 成功捕获到包，清零数据包重试计数器
-        packet_retry_count = 0
-        headers = packet.request.headers
+        # Task and points endpoints are polled directly. Their failures repeat
+        # only those API requests; no browser refresh or desktop reconnect occurs.
+        try:
+            if captured_api_headers:
+                headers = dict(captured_api_headers)
+            else:
+                if not isinstance(api_auth_data, dict) or not api_auth_data.get("secretKey"):
+                    raise AuthenticationExpiredError("当前页面缺少有效 authData")
+                headers = build_task_api_headers(api_auth_data, request_device_code)
+        except AuthenticationExpiredError as error:
+            if api_auth_source == "prechecked":
+                page_auth_data = read_auth_data(page)
+                if (
+                    isinstance(page_auth_data, dict)
+                    and page_auth_data.get("secretKey")
+                    and page_auth_data != api_auth_data
+                ):
+                    print(
+                        "[*] 预检查登录态在桌面登录后失效，"
+                        "仅切换到当前网页 authData 重试任务 API。"
+                    )
+                    api_auth_data = page_auth_data
+                    api_auth_source = "page"
+                    headers = (
+                        dict(captured_api_headers)
+                        if captured_api_headers
+                        else build_task_api_headers(
+                            api_auth_data, request_device_code
+                        )
+                    )
+                else:
+                    print(
+                        f"[-] {current_time_str} {error}；"
+                        "无法取得可用 authData，结束本次任务。"
+                    )
+                    sys.exit(2)
+            else:
+                print(
+                    f"[-] {current_time_str} {error}；"
+                    "无法取得可用 authData，结束本次任务。"
+                )
+                sys.exit(2)
 
         if not redeem_config_checked:
             config = ensure_redeem_config(
@@ -585,52 +1343,212 @@ def wait_for_points_with_points(
             else:
                 print("[*] 已开启积分兑换，继续执行挂机任务 。\n")
 
-        current_progress = fetch_current_progress(url, headers)
+        current_progress: Optional[int] = None
+        api_error: Optional[AuthenticationExpiredError] = None
+        try:
+            current_progress = fetch_current_progress(url, headers)
+        except AuthenticationExpiredError as error:
+            api_error = error
+            if api_auth_source == "prechecked":
+                page_auth_data = read_auth_data(page)
+                if (
+                    isinstance(page_auth_data, dict)
+                    and page_auth_data.get("secretKey")
+                    and page_auth_data != api_auth_data
+                ):
+                    print(
+                        "[*] 预检查登录态在桌面登录后被服务端拒绝，"
+                        "仅切换到当前网页 authData 重试任务 API。"
+                    )
+                    api_auth_data = page_auth_data
+                    api_auth_source = "page"
+                    headers = build_task_api_headers(
+                        api_auth_data, request_device_code
+                    )
+                    try:
+                        current_progress = fetch_current_progress(url, headers)
+                    except AuthenticationExpiredError as page_error:
+                        api_error = page_error
 
-        if current_progress is not None and current_progress > 0:
-            print(
-                f"\r[-] {current_time_str} 挂机剩余 {60 - (current_progress // 60)} 分钟。",
-                end="",
-            )
-            # 进度发生实际变化
-            if current_progress != last_progress:
-                print(
-                    f"\r[-] {current_time_str} 进度更新，目前已挂机 {current_progress // 60} 分钟。"
+            if current_progress is None and api_error is not None:
+                # A UI login can be valid while a locally reconstructed CTG
+                # signature is rejected. Capture the request the web client
+                # itself generates; this is read-only and does not reconnect
+                # or refresh the desktop page.
+                page_headers, packet_progress = capture_page_task_api_request(
+                    page,
+                    pause_file,
+                    runtime_deadline,
+                    timeout=12,
                 )
-                last_progress = current_progress
-                last_progress_update_time = time.time()
-            # 3600 代表任务完成
-            if current_progress >= 3600:
+                if page_headers:
+                    captured_api_headers = page_headers
+                if packet_progress is not None:
+                    current_progress = packet_progress
+                elif page_headers:
+                    retry_headers = dict(page_headers)
+                    try:
+                        current_progress = fetch_current_progress(
+                            url, retry_headers
+                        )
+                    except AuthenticationExpiredError as captured_error:
+                        api_error = captured_error
+                if current_progress is None and not page_headers:
+                    print(
+                        f"[-] {current_time_str} {api_error}；"
+                        "网页没有提供可用任务 API 请求，无法确认挂机完成。"
+                    )
+                    sys.exit(2)
+                if current_progress is None and page_headers:
+                    print(
+                        f"[-] {current_time_str} {api_error}；"
+                        "网页任务 API 请求头也无法确认进度，结束本次任务。"
+                    )
+                    sys.exit(2)
+            elif current_progress is None and api_error is not None:
+                print(
+                    f"[-] {current_time_str} {api_error}；无法确认挂机完成。"
+                )
+                sys.exit(2)
+        next_api_poll_at = time.monotonic() + max(1, step)
+
+        if current_progress is not None:
+            try:
+                current_progress = int(current_progress)
+            except (TypeError, ValueError):
+                print(f"[-] {current_time_str} 服务端返回了无效的挂机进度。")
+                current_progress = None
+
+        if current_progress is not None:
+            last_progress = log_progress_change(
+                current_progress,
+                last_progress,
+                target=TASK_PROGRESS_TARGET,
+                timestamp=current_time_str,
+            )
+            if current_progress >= TASK_PROGRESS_TARGET:
                 print(f"\r[-] {current_time_str} 挂机任务完成。")
+                current_points = fetch_general_points_with_retry(headers)
+                if current_points is None:
+                    print("[*] 积分 API 余额不可用，尝试保留的积分中心页面兼容读取。")
+                    current_points = open_points_center_and_print(
+                        page,
+                        pause_file=pause_file,
+                        runtime_deadline=runtime_deadline,
+                    )
                 auto_redeem_reward_after_hang(
                     page, headers, running_in_docker, current_points
                 )
-                sys.exit(0)
+                return
 
-        time_since_last_update = time.time() - last_progress_update_time
-
-        if time_since_last_update >= max_time:
-            refresh_retry_count += 1
-            print(f"\n[-] {current_time_str} 刷新页面 ({refresh_retry_count}/13)")
-
-            if refresh_retry_count >= refresh_retry_count_max:
-                print(f"[-] {current_time_str} 刷新页面重试次数达到上限，程序终止。")
-                sys.exit(1)
-
-            # 刷新页面
-            page.refresh()
-            time.sleep(5)
-
-            # 刷新页面后，必须重置最后更新时间戳，避免下一轮循环直接再次触发刷新
-            last_progress_update_time = time.time()
-            continue
-
-        time.sleep(step)
-        remaining -= step
-    print("\r[*] 挂机等待完成。")
+        # Progress is used only to confirm completion. No stall-triggered page
+        # refresh, desktop reconnect, or UI action is performed.
 
 
-def fetch_current_progress(url: str, headers: Dict[str, str]) -> int:
+def build_task_api_headers(auth_data: dict, device_code: str) -> Dict[str, str]:
+    """按云电脑 Web 客户端协议为任务接口生成 CTG 签名请求头。"""
+    timestamp = int(time.time() * 1000)
+    request_id = timestamp + 1
+    device_type = CTG_WEB_DEVICE_TYPE
+    tenant_id = str(auth_data.get("tenantId") or 0)
+    user_id = str(auth_data.get("userId") or 0)
+    version = CTG_API_VERSION
+    secret_key = str(auth_data.get("secretKey") or "")
+    signature_source = (
+        f"{device_type}{request_id}{tenant_id}{timestamp}"
+        f"{user_id}{version}{secret_key}"
+    )
+    signature = hashlib.md5(signature_source.encode("utf-8")).hexdigest().upper()
+
+    return {
+        "accept": "application/json, text/plain, */*",
+        "ctg-appchannel": str(auth_data.get("appChannel") or "1"),
+        "ctg-appmodel": CTG_WEB_APP_MODEL,
+        "ctg-authenticate": "1",
+        "ctg-device-manu": "Xiaomi",
+        "ctg-device-model": "xiaomicc",
+        "ctg-devicecode": device_code,
+        "ctg-devicetype": device_type,
+        "ctg-requestid": str(request_id),
+        "ctg-signaturestr": signature,
+        "ctg-softwarecode": "web_client",
+        "ctg-tenantid": tenant_id,
+        "ctg-timestamp": str(timestamp),
+        "ctg-userid": user_id,
+        "ctg-version": version,
+        "from": "App-web",
+        "referer": "https://desk.ctyun.cn/selforder/points.html",
+        "x-lang": "zh-CN",
+        "user-agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "Chrome/143.0.0.0 Safari/537.36"
+        ),
+    }
+
+
+def build_page_task_api_headers(
+    page: ChromiumPage, device_code: str
+) -> Dict[str, str]:
+    """从当前页面 authData 生成带新时间戳/签名的任务接口请求头。"""
+    auth_data = read_auth_data(page)
+    if not isinstance(auth_data, dict) or not auth_data.get("secretKey"):
+        raise AuthenticationExpiredError("当前页面缺少有效 authData")
+    return build_task_api_headers(auth_data, device_code)
+
+
+def fetch_signed_task_progress(
+    auth_data: dict, device_code: str, log_errors: bool = False
+) -> tuple[Optional[int], Dict[str, str]]:
+    """直接通过已保存的 authData 查询任务进度，无需打开云桌面。"""
+    headers = build_task_api_headers(auth_data, device_code)
+    progress = fetch_current_progress(
+        POINTS_TASK_LIST_URL, headers, log_errors=log_errors
+    )
+    return progress, headers
+
+
+def fetch_general_points(headers: Dict[str, str]) -> Optional[int]:
+    """通过积分中心 API 获取通用积分余额。"""
+    try:
+        response = requests.get(USER_POINTS_URL, headers=clean_headers(headers), timeout=5)
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or result.get("code") != 0:
+            print("[!] 积分 API 未返回成功状态；下次只重试该 API。")
+            return None
+        points_list = result.get("data")
+        if not isinstance(points_list, list):
+            print("[!] 积分 API 返回数据格式无效；下次只重试该 API。")
+            return None
+        for item in points_list:
+            if isinstance(item, dict) and str(item.get("pointType", "")) == "1":
+                if item.get("points") is None:
+                    return None
+                return int(item["points"])
+        print("[!] 积分 API 未返回通用积分余额；下次只重试该 API。")
+        return None
+    except (requests.RequestException, TypeError, ValueError) as error:
+        print(f"[!] 获取通用积分失败：{error}；下次只重试该 API。")
+        return None
+
+
+def fetch_general_points_with_retry(
+    headers: Dict[str, str], attempts: int = 3, delay: int = 2
+) -> Optional[int]:
+    """Retry only the points API; never refresh or reopen the desktop page."""
+    for attempt in range(1, attempts + 1):
+        points = fetch_general_points(headers)
+        if points is not None:
+            return points
+        if attempt < attempts:
+            print(f"[*] 积分 API 重试 ({attempt}/{attempts - 1})。")
+            time.sleep(delay)
+    return None
+
+
+def fetch_current_progress(
+    url: str, headers: Dict[str, str], log_errors: bool = True
+) -> Optional[int]:
     """
     向指定的 URL 发起 GET 请求，并直接解析提取 currentProgress 的值。
     Args:
@@ -643,22 +1561,26 @@ def fetch_current_progress(url: str, headers: Dict[str, str]) -> int:
     try:
         headers = clean_headers(headers)
 
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=5)
 
         response.raise_for_status()
 
         data = response.json()
-        task_list = data.get("data")
+        if isinstance(data, dict) and data.get("code") == 40010:
+            raise AuthenticationExpiredError(
+                "当前登录信息已过期，请重新登录"
+            )
+        progress = extract_current_progress(data)
+        if progress is None and log_errors:
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{current_time}] 任务列表中缺少“使用1小时”任务或 currentProgress；仅重试任务 API。")
+        return progress
 
-        for task in task_list:
-            if task.get("taskDefName") == "使用1小时":
-                return task.get("currentProgress")
-        return 0
-
-    except (requests.RequestException, ValueError) as error:
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{current_time}] 获取或解析数据失败: {error}")
-        return 0
+    except (requests.RequestException, TypeError, ValueError) as error:
+        if log_errors:
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{current_time}] 获取或解析数据失败: {error}")
+        return None
 
 
 def get_redeem_config_path(running_in_docker: bool) -> str:
@@ -890,7 +1812,8 @@ def prompt_and_create_redeem_config(
     if not sys.stdin.isatty():
         print("[*] 检测到后台启动模式，跳过兑换配置交互。")
         print(
-            "[*] 如需配置兑换，请在容器内手动执行: python3 /app/pc_login.py --config-redeem"
+            "[*] 如需配置兑换，请执行: /app/run_task.sh pc "
+            "/usr/bin/python3 -u /app/pc_login.py --config-redeem"
         )
         return {}
 
@@ -1025,14 +1948,19 @@ def try_redeem_reward_once(
 
 
 def auto_redeem_reward_after_hang(
-    page: ChromiumPage,
+    page: Optional[ChromiumPage],
     request_headers: Dict[str, str],
     running_in_docker: bool,
-    current_points: int,
+    current_points: Optional[int],
 ) -> None:
     headers = clean_headers(request_headers)
     config_path = get_redeem_config_path(running_in_docker)
-    config = ensure_redeem_config(page, headers, running_in_docker)
+    if page is None:
+        # A completed task can be handled without opening a desktop. In this
+        # path only an existing non-interactive redemption config is honored.
+        config = load_redeem_config(config_path)
+    else:
+        config = ensure_redeem_config(page, headers, running_in_docker)
     if not config:
         return
 
@@ -1055,6 +1983,13 @@ def auto_redeem_reward_after_hang(
         print("[!] 配置中的 costPoints 异常，跳过兑换。")
         return
 
+    if current_points is None:
+        print("[!] 无法读取积分余额，跳过自动兑换；不会猜测兑换次数。")
+        return
+    if current_points <= 0:
+        print("[*] 当前积分为 0，跳过兑换。")
+        return
+
     today = datetime.date.today()
     can_redeem_today, reason = should_redeem_today(config, today)
     if not can_redeem_today:
@@ -1062,21 +1997,17 @@ def auto_redeem_reward_after_hang(
         return
     print(f"[*] 兑换计划命中：{reason}")
 
-    if current_points > 0:
-        can_redeem_times = current_points // cost_points
-        if can_redeem_times <= 0:
-            print(
-                f"[*] 当前积分 {current_points} 小于单次兑换所需 {cost_points}，本次不兑换。"
-            )
-            return
-        final_times = (
-            can_redeem_times
-            if max_redeem_times == 0
-            else min(can_redeem_times, max_redeem_times)
+    can_redeem_times = current_points // cost_points
+    if can_redeem_times <= 0:
+        print(
+            f"[*] 当前积分 {current_points} 小于单次兑换所需 {cost_points}，本次不兑换。"
         )
-    else:
-        final_times = 1 if max_redeem_times == 0 else max_redeem_times
-        print("[!] 当前积分读取失败，按配置次数降级尝试兑换。")
+        return
+    final_times = (
+        can_redeem_times
+        if max_redeem_times == 0
+        else min(can_redeem_times, max_redeem_times)
+    )
 
     print(
         f"[*] 准备自动兑换({prod_name})：prodId={prod_id}, desktopId={desktop_id}, "
@@ -1111,19 +2042,29 @@ def execute_login(
     max_retries: int = 6,
 ) -> bool:
     """执行云电脑登录流程。"""
+    automatic_trigger = is_automatic_pc_trigger()
+    navigation_timeout = 15 if automatic_trigger else 30
     # 最大重试次数设置
     for attempt_ in range(1, max_retries + 1):
         try:
-            page.get(LOGIN_URL)
+            page.get(LOGIN_URL, **pc_navigation_options())
 
-            # 等待页面开始加载，如果 30 秒未响应，DrissionPage 可能会抛出异常或后续操作失败
-            is_loaded = page.wait.doc_loaded(timeout=30)
+            # Scheduled runs keep one navigation round short so the outer retry
+            # policy can recover instead of spending minutes in page-load retries.
+            is_loaded = page.wait.doc_loaded(timeout=navigation_timeout)
 
             if not is_loaded:
-                raise TimeoutError("[*] 等待页面加载响应超时 (30秒)")
+                raise TimeoutError(
+                    f"[*] 等待页面加载响应超时 ({navigation_timeout}秒)"
+                )
 
             # 填写账号密码
-            fill_credentials(page, username, password)
+            fill_credentials(
+                page,
+                username,
+                password,
+                selector_timeout=5 if automatic_trigger else 60,
+            )
             break
 
         except Exception:
@@ -1144,7 +2085,9 @@ def execute_login(
             fill_captcha_if_possible(page)
             click_login_button(page)
 
-            toast_text = get_latest_toast(page, timeout=20)
+            toast_text = get_latest_toast(
+                page, timeout=10 if automatic_trigger else 20
+            )
             if toast_text:
                 print(f"[*] 登录提示: {toast_text}")
 
@@ -1183,6 +2126,8 @@ class NumericOcrSolver:
         return cls._instance
 
     def _init_engine(self) -> None:
+        import ddddocr
+
         self.ocr = ddddocr.DdddOcr(show_ad=False)
         self.ocr.set_ranges(0)
 
@@ -1205,40 +2150,55 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="仅执行兑换配置交互，不进入挂机流程",
     )
+    parser.add_argument(
+        "--precheck-complete",
+        action="store_true",
+        help="只读查询服务端挂机进度；返回状态 10 表示已完成",
+    )
+    parser.add_argument(
+        "--redeem-completed-task",
+        action="store_true",
+        help="重新确认挂机已完成后，执行已配置的自动积分兑换",
+    )
     return parser.parse_args()
 
 
-def main(config_redeem_only: bool = False) -> None:
-    username = os.getenv("APP_USER")
-    password = os.getenv("APP_PASSWORD")
-    running_in_docker = os.getenv("RUNNING_IN_DOCKER") == "true"
-
-    if not username or not password:
-        print("[!] 缺少环境变量 APP_USER 或 APP_PASSWORD。")
-        sys.exit(1)
-
-    if not config_redeem_only:
-        pause_file = os.getenv(
-            "PC_TASK_PAUSE_FILE",
-            "/app/data/.pause_pc_login" if running_in_docker else "./.pause_pc_login",
-        )
-        if os.path.exists(pause_file):
-            print("[*] 检测到云电脑挂机暂停标记，跳过本次任务。")
-            return
-
-    auth_data_file = get_auth_data_file(username, running_in_docker)
-    device_code = get_device_code(username, running_in_docker)
-
+def run_browser_task_attempt(
+    username: str,
+    password: str,
+    auth_data_file: str,
+    device_code: str,
+    running_in_docker: bool,
+    config_redeem_only: bool,
+    pause_file: str,
+    runtime_deadline: Optional[float] = None,
+    task_auth_data: Optional[dict] = None,
+) -> None:
+    """Run one isolated browser session; quitting it stops page auto-reconnect."""
+    ensure_pc_runtime(runtime_deadline)
+    if os.path.exists(pause_file):
+        print("[*] 检测到维护暂停标记，在启动浏览器前退出。")
+        return
     options = init_browser_options(running_in_docker)
-    page = ChromiumPage(addr_or_opts=options)
-    atexit.register(page.quit)
-
+    page: Optional[ChromiumPage] = None
+    monitor = DesktopCdpMonitor()
     try:
-        # 先注入本地会话，再进入 desktop-list 判断状态
-        page.get(LOGIN_URL)
+        page = ChromiumPage(addr_or_opts=options)
+        if is_automatic_pc_trigger():
+            page.set.timeouts(base=3, page_load=15, script=3)
+        # Inject the saved session before opening the desktop list.
+        page.get(LOGIN_URL, **pc_navigation_options())
+        attach_desktop_cdp_monitor(page, monitor)
         inject_local_storage_session(page, device_code, auth_data_file)
-        page.refresh()
-        time.sleep(2)
+        # The page may enter the desktop automatically during this refresh.
+        # Subscribe before navigation so CDP sees the WebSocket creation event.
+        monitor.begin_desktop_attempt()
+        ensure_pc_runtime(runtime_deadline)
+        if os.path.exists(pause_file):
+            print("[*] 检测到维护暂停标记，取消登录态刷新。")
+            return
+        page.get(LOGIN_URL, **pc_navigation_options())
+        time.sleep(1 if is_automatic_pc_trigger() else 2)
 
         relogin_attempts = 0
         max_relogin_attempts = 3
@@ -1247,9 +2207,20 @@ def main(config_redeem_only: bool = False) -> None:
         desktop_opened = False
 
         while True:
-            page.get(DESKTOP_URL)
+            ensure_pc_runtime(runtime_deadline)
+            if os.path.exists(pause_file):
+                print("[*] 检测到云电脑挂机暂停标记，结束云电脑连接任务。")
+                return
+
+            ensure_pc_runtime(runtime_deadline)
+            if os.path.exists(pause_file):
+                print("[*] 检测到维护暂停标记，取消网页桌面导航。")
+                return
+            page.get(DESKTOP_URL, **pc_navigation_options())
             time.sleep(1)
-            wait_desktop_list_refresh_done(page, timeout=60)
+            wait_desktop_list_refresh_done(
+                page, timeout=30 if is_automatic_pc_trigger() else 60
+            )
             state = get_desktop_state(page)
             print(f"\r[*] desktop-list 状态: {state}")
 
@@ -1261,7 +2232,10 @@ def main(config_redeem_only: bool = False) -> None:
                 print(
                     f"[*] 检测到未登录或登录态过期，开始账号密码重登 ({relogin_attempts}/{max_relogin_attempts})"
                 )
-                if not execute_login(page, username, password):
+                login_retries = 3 if is_automatic_pc_trigger() else 6
+                if not execute_login(
+                    page, username, password, max_retries=login_retries
+                ):
                     print("[!] 重新登录失败。")
                     sys.exit(1)
                 save_auth_data(page, auth_data_file)
@@ -1269,50 +2243,70 @@ def main(config_redeem_only: bool = False) -> None:
 
             if state == "no_desktop":
                 print("[*] 当前账号无云电脑资源，任务结束。")
-                sys.exit(0)
+                return
 
             if state == "only_phone":
                 print("[*] 当前账号仅有云手机资源，任务结束。")
-                sys.exit(0)
+                return
 
             if state == "has_pc_button":
+                if os.path.exists(pause_file):
+                    print("[*] 检测到云电脑挂机暂停标记，取消桌面连接。")
+                    return
                 if desktop_open_attempts >= MAX_DESKTOP_OPEN_ATTEMPTS:
-                    print("[!] 云电脑连接重试次数达到上限，任务结束。")
+                    print("[!] 当前网页会话的桌面进入次数已达上限。")
                     sys.exit(1)
                 desktop_open_attempts += 1
                 print(
                     "[*] 检测到“进入AI云电脑”按钮，尝试连接云电脑 "
                     f"({desktop_open_attempts}/{MAX_DESKTOP_OPEN_ATTEMPTS})。"
                 )
+                monitor.begin_desktop_attempt()
+                ensure_pc_runtime(runtime_deadline)
+                if os.path.exists(pause_file):
+                    print("[*] 检测到维护暂停标记，取消桌面连接。")
+                    return
                 if not click_enter_ai_pc(page):
                     print("[!] 未能点击“进入AI云电脑”按钮。")
-                    if desktop_open_attempts >= MAX_DESKTOP_OPEN_ATTEMPTS:
-                        print("[!] 云电脑连接重试次数达到上限，任务结束。")
-                        sys.exit(1)
-                    continue
-                if not wait_desktop_opened(page, timeout=240):
-                    print("[!] 云电脑尚未连接成功。")
-                    print("[!] 为避免重复连接重置桌面会话，本次停止重试。")
                     sys.exit(1)
-
+                wait_result = wait_desktop_opened(
+                    page,
+                    timeout=240,
+                    pause_file=pause_file,
+                    monitor=monitor,
+                    running_in_docker=running_in_docker,
+                    runtime_deadline=runtime_deadline,
+                )
+                if wait_result != CONNECTED:
+                    if os.path.exists(pause_file):
+                        return
+                    raise DesktopConnectionFailure(wait_result)
                 desktop_opened = True
                 break
 
             if state == "desktop_entered_auto":
                 if desktop_open_attempts >= MAX_DESKTOP_OPEN_ATTEMPTS:
-                    print("[!] 云电脑连接重试次数达到上限，任务结束。")
+                    print("[!] 当前网页会话的桌面进入次数已达上限。")
                     sys.exit(1)
                 desktop_open_attempts += 1
                 print(
                     "[*] 页面已跳转，正在等待云电脑连接 "
                     f"({desktop_open_attempts}/{MAX_DESKTOP_OPEN_ATTEMPTS})。"
                 )
-                if wait_desktop_opened(page, timeout=240):
-                    desktop_opened = True
-                    break
-                print("[!] 云电脑尚未连接成功。")
-                print("[!] 为避免重复连接重置桌面会话，本次停止重试。")
-                sys.exit(1)
+                wait_result = wait_desktop_opened(
+                    page,
+                    timeout=240,
+                    pause_file=pause_file,
+                    monitor=monitor,
+                    running_in_docker=running_in_docker,
+                    runtime_deadline=runtime_deadline,
+                )
+                if wait_result != CONNECTED:
+                    if os.path.exists(pause_file):
+                        return
+                    raise DesktopConnectionFailure(wait_result)
+                desktop_opened = True
+                break
 
             unknown_attempts += 1
             if unknown_attempts >= 3:
@@ -1332,18 +2326,363 @@ def main(config_redeem_only: bool = False) -> None:
         else:
             print("[-] 登录成功，但未能读取 authData.mobilephone。")
 
+        active_device_code = read_page_device_code(page, device_code)
+
         wait_for_points_with_points(
             page,
-            HANG_SECONDS,
             running_in_docker=running_in_docker,
             config_redeem_only=config_redeem_only,
+            device_code=active_device_code,
+            monitor=monitor,
+            runtime_deadline=runtime_deadline,
+            task_auth_data=task_auth_data,
         )
-        page.quit()
+    except (PcMaxRuntimeExpired, PcTaskAuthorizationLost, DesktopConnectionFailure):
+        raise
+    except SystemExit as error:
+        if not is_automatic_pc_trigger() or error.code != 1:
+            raise
+        reason = "Cron/INIT_RUN 浏览器流程以失败状态退出"
+        diagnostic_path = (
+            save_desktop_disconnect_diagnostic(
+                page, monitor, UNKNOWN, reason, running_in_docker
+            )
+            if page is not None
+            else None
+        )
+        print("[!] 自动触发的网页流程失败，归类为 UNKNOWN，由外层有限重试。")
+        raise DesktopConnectionFailure(UNKNOWN, diagnostic_path) from error
+    except Exception as error:
+        if not is_automatic_pc_trigger():
+            raise
+        reason = f"Cron/INIT_RUN 浏览器流程异常（{type(error).__name__}）"
+        diagnostic_path = (
+            save_desktop_disconnect_diagnostic(
+                page, monitor, UNKNOWN, reason, running_in_docker
+            )
+            if page is not None
+            else None
+        )
+        print("[!] 自动触发的网页流程异常，归类为 UNKNOWN，由外层有限重试。")
+        raise DesktopConnectionFailure(UNKNOWN, diagnostic_path) from error
+    finally:
+        # Closing the Chromium process cancels the website's own reconnect loop.
+        if page is not None:
+            try:
+                page.quit()
+            except Exception as error:
+                raise BrowserCleanupFailure(
+                    f"Chromium 未能确认关闭；禁止发起下一轮网页连接：{error}"
+                ) from error
+            wait_for_task_child_processes()
 
-    except Exception as e:
-        # save_screenshot(page)
-        print(f"[!] 执行异常: {e}")
+
+def fetch_signed_progress_with_retry(
+    auth_data: dict,
+    device_code: str,
+    attempts: int = 3,
+    delay: int = 2,
+) -> tuple[Optional[int], Optional[Dict[str, str]]]:
+    """Retry only the task API when checking completion before a reconnect."""
+    headers: Optional[Dict[str, str]] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            progress, headers = fetch_signed_task_progress(
+                auth_data, device_code, log_errors=True
+            )
+        except AuthenticationExpiredError:
+            raise
+        if progress is not None:
+            return progress, headers
+        if attempt < attempts:
+            print(f"[*] 完成状态 API 重试 ({attempt}/{attempts - 1})。")
+            time.sleep(delay)
+    return None, headers
+
+
+def get_saved_task_progress(
+    running_in_docker: bool,
+) -> tuple[Optional[int], Optional[Dict[str, str]]]:
+    """Read saved session task progress without opening a browser or mutating state."""
+    username = os.getenv("APP_USER")
+    if not username:
+        print("[*] 完成状态预检查缺少 APP_USER，稍后走正常授权流程。")
+        return None, None
+
+    auth_data = load_auth_data_from_file(
+        get_auth_data_file(username, running_in_docker)
+    )
+    if not auth_data:
+        print("[*] 没有已保存的 authData，稍后走正常授权流程。")
+        return None, None
+
+    device_code = os.getenv("DEVICECODE", "").strip()
+    if not device_code:
+        device_code_file = (
+            f"/app/data/.devicecode_{username}"
+            if running_in_docker
+            else f"./.devicecode_{username}"
+        )
+        try:
+            device_code = Path(device_code_file).read_text(encoding="utf-8").strip()
+        except OSError:
+            device_code = ""
+    if not device_code:
+        print("[*] 没有已保存的 DEVICECODE，稍后走正常授权流程。")
+        return None, None
+
+    try:
+        current_progress, headers = fetch_signed_progress_with_retry(
+            auth_data, device_code
+        )
+    except AuthenticationExpiredError as error:
+        print(f"[*] 完成状态预检查不可用：{error}；稍后走正常授权流程。")
+        return None, None
+    if current_progress is None:
+        print("[*] 暂时无法确认任务进度，稍后走正常授权流程。")
+        return None, None
+
+    return current_progress, headers
+
+
+def precheck_completed_task(running_in_docker: bool) -> bool:
+    """Pure read-only completion check used before stopping the DLL."""
+    current_progress, _headers = get_saved_task_progress(running_in_docker)
+    if current_progress is None:
+        print("[*] 暂时无法确认任务进度，稍后走正常授权流程。")
+        return False
+
+    print(
+        f"[*] 挂机只读预检查 currentProgress: "
+        f"{current_progress}/{TASK_PROGRESS_TARGET}"
+    )
+    if current_progress < TASK_PROGRESS_TARGET:
+        return False
+
+    print("[*] 服务端已确认挂机任务完成；只读预检查未执行积分查询或兑换。")
+    return True
+
+
+def redeem_completed_task(running_in_docker: bool) -> bool:
+    """Recheck completion, then run the explicitly requested redemption phase."""
+    current_progress, headers = get_saved_task_progress(running_in_docker)
+    if current_progress is None:
+        print("[!] 兑换前无法确认服务端任务进度，跳过正式兑换阶段。")
+        return False
+    print(
+        f"[*] 正式兑换前确认 currentProgress: "
+        f"{current_progress}/{TASK_PROGRESS_TARGET}"
+    )
+    if current_progress < TASK_PROGRESS_TARGET:
+        print("[*] 服务端任务当前未完成，跳过正式兑换阶段。")
+        return False
+
+    print("[*] 服务端任务已完成，开始执行已配置的正式积分兑换阶段。")
+    request_headers = headers or {}
+    current_points = fetch_general_points_with_retry(request_headers)
+    auto_redeem_reward_after_hang(
+        None, request_headers, running_in_docker, current_points
+    )
+    return True
+
+
+def graceful_shutdown_signal(signum, _frame) -> None:
+    signal_name = signal.Signals(signum).name
+    print(f"[*] 收到 {signal_name}，开始关闭浏览器并清理任务。")
+    raise SystemExit(128 + signum)
+
+
+def main(
+    config_redeem_only: bool = False,
+    precheck_complete: bool = False,
+    redeem_completed_task_only: bool = False,
+) -> None:
+    signal.signal(signal.SIGTERM, graceful_shutdown_signal)
+    signal.signal(signal.SIGINT, graceful_shutdown_signal)
+
+    if precheck_complete:
+        running_in_docker = os.getenv("RUNNING_IN_DOCKER") == "true"
+        sys.exit(10 if precheck_completed_task(running_in_docker) else 11)
+
+    if redeem_completed_task_only:
+        running_in_docker = os.getenv("RUNNING_IN_DOCKER") == "true"
+        sys.exit(10 if redeem_completed_task(running_in_docker) else 11)
+
+    if not pc_task_authorization_valid():
+        print("[!] 网页任务必须通过 /app/run_task.sh pc 启动并完成 DLL 交接。")
+        sys.exit(2)
+
+    username = os.getenv("APP_USER")
+    password = os.getenv("APP_PASSWORD")
+    running_in_docker = os.getenv("RUNNING_IN_DOCKER") == "true"
+    if not username or not password:
+        print("[!] 缺少环境变量 APP_USER 或 APP_PASSWORD。")
         sys.exit(1)
+
+    pause_file = get_pc_pause_file(running_in_docker)
+    if pc_task_pause_requested(running_in_docker):
+        print("[*] 检测到维护暂停标记，跳过本次网页任务。")
+        return
+
+    runtime_deadline = time.monotonic() + get_pc_max_runtime_seconds()
+    auth_data_file = get_auth_data_file(username, running_in_docker)
+    device_code = get_device_code(username, running_in_docker)
+    task_auth_data: Optional[dict] = None
+
+    if not config_redeem_only:
+        saved_auth_data = load_auth_data_from_file(auth_data_file)
+        if saved_auth_data:
+            try:
+                initial_progress, initial_headers = fetch_signed_progress_with_retry(
+                    saved_auth_data, device_code
+                )
+            except AuthenticationExpiredError as error:
+                print(f"[!] {error}。继续由现有网页登录流程刷新登录态。")
+                initial_progress, initial_headers = None, None
+            if initial_progress is not None and initial_progress >= TASK_PROGRESS_TARGET:
+                print("[*] 服务端 currentProgress 已达到 3600，跳过网页连接。")
+                headers = initial_headers or build_task_api_headers(saved_auth_data, device_code)
+                current_points = fetch_general_points_with_retry(headers)
+                auto_redeem_reward_after_hang(
+                    None, headers, running_in_docker, current_points
+                )
+                return
+            if initial_progress is not None:
+                # Preserve the credentials just validated by the read-only API
+                # precheck in case the browser later rotates its local session.
+                task_auth_data = saved_auth_data
+        else:
+            print("[*] 本地没有可用于完成状态预检的 authData，继续浏览器登录流程。")
+
+    reconnects_used = 0
+    reconnect_pending = False
+    while True:
+        try:
+            ensure_pc_runtime(runtime_deadline)
+            if pc_task_pause_requested(running_in_docker):
+                print("[*] 检测到维护暂停标记，停止或取消网页挂机。")
+                return
+
+            if reconnect_pending:
+                saved_auth_data = load_auth_data_from_file(auth_data_file)
+                if not saved_auth_data:
+                    print("[!] 重连前缺少 authData，无法确认任务是否完成；停止重连。")
+                    return
+                progress_auth_expired = False
+                try:
+                    current_progress, current_headers = fetch_signed_progress_with_retry(
+                        saved_auth_data, device_code
+                    )
+                except AuthenticationExpiredError as error:
+                    if not is_automatic_pc_trigger():
+                        print(f"[!] 重连前任务 API 登录态失效：{error}；停止重连。")
+                        return
+                    # The next bounded scheduled attempt reloads the page and
+                    # lets the existing login flow refresh its saved session.
+                    print(
+                        f"[!] 重连前任务 API 登录态失效：{error}；"
+                        "Cron/INIT_RUN 将在剩余重试预算内继续，由网页登录流程刷新会话。"
+                    )
+                    progress_auth_expired = True
+                    current_progress, current_headers = None, None
+                    task_auth_data = None
+                if current_progress is None and not progress_auth_expired:
+                    print("[!] 重连前无法确认服务端任务状态；仅重试 API 后仍不可用，停止重连。")
+                    return
+                if (
+                    current_progress is not None
+                    and current_progress >= TASK_PROGRESS_TARGET
+                ):
+                    print("[*] 重连前确认 currentProgress 已达到 3600，停止网页连接。")
+                    headers = current_headers or build_task_api_headers(saved_auth_data, device_code)
+                    current_points = fetch_general_points_with_retry(headers)
+                    auto_redeem_reward_after_hang(
+                        None, headers, running_in_docker, current_points
+                    )
+                    return
+                if current_progress is not None:
+                    task_auth_data = saved_auth_data
+                if pc_task_pause_requested(running_in_docker):
+                    print("[*] 重连前检测到维护暂停标记，取消网页连接。")
+                    return
+                reconnect_pending = False
+
+            run_browser_task_attempt(
+                username=username,
+                password=password,
+                auth_data_file=auth_data_file,
+                device_code=device_code,
+                running_in_docker=running_in_docker,
+                config_redeem_only=config_redeem_only,
+                pause_file=pause_file,
+                runtime_deadline=runtime_deadline,
+                task_auth_data=task_auth_data,
+            )
+            return
+        except PcMaxRuntimeExpired as error:
+            print(f"[*] {error}")
+            return
+        except PcTaskAuthorizationLost as error:
+            print(f"[!] {error}")
+            return
+        except DesktopConnectionFailure as error:
+            automatic_trigger = is_automatic_pc_trigger()
+            delay = next_network_reconnect_delay(
+                reconnects_used,
+                NETWORK_RETRYABLE if automatic_trigger else error.classification,
+            )
+            if delay is None:
+                if automatic_trigger:
+                    print(
+                        "[!] Cron/INIT_RUN 桌面连接重试次数已达上限（"
+                        f"{MAX_DESKTOP_NETWORK_RECONNECTS} 次），任务未完成。"
+                    )
+                elif error.classification == NETWORK_RETRYABLE:
+                    print(
+                        "[!] 桌面网络故障重连次数已达上限（"
+                        f"{MAX_DESKTOP_NETWORK_RECONNECTS}次），任务结束。"
+                    )
+                elif error.classification == PREEMPTED:
+                    print("[!] 检测到客户端连接冲突，任务立即退出，不重连。")
+                else:
+                    print("[!] 断线原因 UNKNOWN，保守退出，不重连。")
+                sys.exit(1)
+
+            reconnects_used += 1
+            reconnect_pending = True
+            if automatic_trigger:
+                print(
+                    f"[*] Cron/INIT_RUN 任务遇到 {error.classification}，"
+                    f"第 {reconnects_used}/{MAX_DESKTOP_NETWORK_RECONNECTS} 次重连将在 {delay} 秒后开始。"
+                )
+            else:
+                print(
+                    f"[*] 已确认是当前网页桌面连接的网络故障；"
+                    f"第 {reconnects_used}/{MAX_DESKTOP_NETWORK_RECONNECTS} 次重连将在 {delay} 秒后开始。"
+                )
+            # run_browser_task_attempt has quit Chromium before returning here.
+            remaining_delay = delay
+            while remaining_delay > 0:
+                try:
+                    ensure_pc_runtime(runtime_deadline)
+                except PcMaxRuntimeExpired as runtime_error:
+                    print(f"[*] {runtime_error}")
+                    return
+                except PcTaskAuthorizationLost as authorization_error:
+                    print(f"[!] {authorization_error}")
+                    return
+                if pc_task_pause_requested(running_in_docker):
+                    print("[*] 等待重连时检测到维护暂停标记，取消重连。")
+                    return
+                sleep_for = min(1, remaining_delay)
+                time.sleep(sleep_for)
+                remaining_delay -= sleep_for
+        except BrowserCleanupFailure as error:
+            print(f"[!] {error}")
+            sys.exit(1)
+        except Exception as error:
+            print(f"[!] 执行异常: {error}")
+            sys.exit(1)
 
 
 def save_screenshot(page: ChromiumPage) -> None:
@@ -1357,5 +2696,10 @@ def save_screenshot(page: ChromiumPage) -> None:
 
 if __name__ == "__main__":
     args = parse_args()
-    print("[*] 开始进行云电脑挂机")
-    main(config_redeem_only=args.config_redeem)
+    if not args.precheck_complete:
+        print("[*] 开始进行云电脑挂机")
+    main(
+        config_redeem_only=args.config_redeem,
+        precheck_complete=args.precheck_complete,
+        redeem_completed_task_only=args.redeem_completed_task,
+    )

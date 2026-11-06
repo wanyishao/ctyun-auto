@@ -12,7 +12,6 @@ import threading
 import time
 from typing import Optional, Union
 
-import ddddocr
 from DrissionPage import ChromiumOptions, ChromiumPage
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -119,12 +118,32 @@ def init_browser_options() -> ChromiumOptions:
 def fill_credentials(page: ChromiumPage, username: str, password: str) -> None:
     """在页面上填写账号与密码信息。"""
     print("正在输入账号信息...")
-    account_input = page.ele('css:input[type="text"]')
+    account_input = find_displayed_element(
+        page,
+        (
+            'css:input[type="text"]',
+            'css:input[autocomplete="username"]',
+            'css:input[placeholder*="账号"]',
+            'css:input[placeholder*="手机号"]',
+        ),
+        timeout=10,
+    )
+    if not account_input:
+        raise RuntimeError("登录页未找到可见的账号输入框")
     account_input.clear()
     account_input.input(username)
 
     print("正在输入密码信息...")
-    password_input = page.ele('css:input[type="password"]')
+    password_input = find_displayed_element(
+        page,
+        (
+            'css:input[type="password"]',
+            'css:input[autocomplete="current-password"]',
+        ),
+        timeout=10,
+    )
+    if not password_input:
+        raise RuntimeError("登录页未找到可见的密码输入框")
     password_input.clear()
     password_input.input(password)
 
@@ -164,6 +183,8 @@ def analyze_login_response(response_body: Union[dict, str, None]) -> int:
         return 2
     elif code == 51040 and "图形验证码" in msg:
         return 3
+    elif code in (0, 200, "0", "200") or response_body.get("success") is True:
+        return 0
     return -1
 
 
@@ -199,30 +220,39 @@ def execute_login_with_listener(
     login_button = page.ele("css:button.lgm-submit-ct")
 
     page.listen.start("api/auth/iam/login")
-    login_button.click()
+    try:
+        login_button.click()
+        print("已点击登录，等待接口响应或页面跳转...")
+        packet = page.listen.wait(timeout=15)
+    finally:
+        try:
+            page.listen.stop()
+        except Exception:
+            pass
 
-    print("已点击登录，等待接口返回...")
-    packet = page.listen.wait(timeout=5)
-    page.listen.stop()
+    status_code = (
+        analyze_login_response(packet.response.body) if packet else None
+    )
 
-    if not packet:
-        raise RuntimeError("未捕获到登录接口数据包，检查是否已重定向。")
-
-    status_code = analyze_login_response(packet.response.body)
-
-    if status_code == 0:
-        print("登录成功")
-        return True
-    elif status_code == 1:
+    if status_code == 1:
         print("登录失败：用户名或密码错误。")
         return False
     elif status_code in [2, 3]:
         print(f"登录受阻（状态码 {status_code}），准备重试...")
         time.sleep(1)
         raise RuntimeError("登录受阻，准备重试。")
+
+    # 某些版本登录后会通过 CAS 跳转，不保证监听器能收到 XHR 响应；
+    # 以离开登录路由并重新出现聊天输入框作为最终的登录成功依据。
+    if wait_for_chat_authentication(page, timeout=15):
+        print("登录成功，已返回 AI 聊天页面。")
+        return True
+
+    if packet:
+        print("已收到登录响应，但页面仍未进入已登录的 AI 聊天路由。")
     else:
-        print(f"未知响应: {packet.response.body}")
-        return False
+        print("未捕获登录接口响应，且页面未跳转到已登录的 AI 聊天路由。")
+    return False
 
 
 def display_user_info(page: ChromiumPage) -> None:
@@ -263,6 +293,86 @@ def find_displayed_element(page: ChromiumPage, selectors, timeout: float = 10):
         if time.monotonic() >= deadline:
             return None
         time.sleep(0.2)
+
+
+def get_chat_route(page: ChromiumPage) -> str:
+    """返回聊天应用的 hash 路由，不包含查询参数。"""
+    url = page.url or ""
+    route = url.partition("#")[2]
+    if not route:
+        return ""
+    return route.split("?", 1)[0].rstrip("/") or "/"
+
+
+def is_chat_login_route(page: ChromiumPage) -> bool:
+    """识别聊天站点跳转到登录页的情况，避免把登录页输入框误当聊天框。"""
+    url = page.url or ""
+    route = get_chat_route(page)
+    if route == "/login" or route.endswith("/login"):
+        return True
+    return "/cloudB/dy/iam" in url
+
+
+def is_chat_authenticated(page: ChromiumPage) -> bool:
+    """聊天输入框只有在登录路由之外才代表有效会话。"""
+    if is_chat_login_route(page):
+        return False
+    return bool(find_displayed_element(page, CHAT_INPUT_SELECTORS, timeout=1))
+
+
+def wait_for_chat_authentication(page: ChromiumPage, timeout: float = 15) -> bool:
+    """等待 CAS 登录完成并返回聊天页面。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if is_chat_authenticated(page):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def get_chat_dom_hints(page: ChromiumPage) -> dict:
+    """采集不含页面正文的回复容器线索，便于定位前端 DOM 变更。"""
+    try:
+        return page.run_js(
+            r'''const visible = el => {
+                const bounds = el.getBoundingClientRect();
+                return bounds.width > 0 && bounds.height > 0;
+            };
+            const selectors = [
+                "div.markdown-content",
+                "[data-role='assistant']",
+                "[data-message-role='assistant']",
+                "[class*='markdown']",
+                "[class*='markdown-content']",
+                "[class*='answer-content']",
+                "[class*='assistant-content']"
+            ];
+            const candidates = [...document.querySelectorAll("*")]
+                .filter(visible)
+                .filter(el => /answer|assistant|message|markdown|reply/i.test(
+                    typeof el.className === "string" ? el.className : ""
+                ) || el.hasAttribute("data-role") || el.hasAttribute("data-message-role"))
+                .slice(-30)
+                .map(el => ({
+                    tag: el.tagName,
+                    className: typeof el.className === "string" ? el.className : "",
+                    role: el.getAttribute("role"),
+                    dataRole: el.getAttribute("data-role"),
+                    dataMessageRole: el.getAttribute("data-message-role")
+                }));
+            return {
+                route: location.hash.split("?")[0],
+                title: document.title,
+                selectorCounts: selectors.map(selector => ({
+                    selector,
+                    total: document.querySelectorAll(selector).length,
+                    visible: [...document.querySelectorAll(selector)].filter(visible).length
+                })),
+                candidates
+            };'''
+        ) or {}
+    except Exception as error:
+        return {"diagnosticError": type(error).__name__}
 
 
 def get_chat_replies(page: ChromiumPage) -> list[str]:
@@ -358,6 +468,9 @@ def chat_and_earn_points(page: ChromiumPage) -> None:
         print(f"\n正在跳转至 AI 聊天页面: {CHAT_URL}")
         page.get(CHAT_URL)
 
+    if is_chat_login_route(page):
+        raise RuntimeError("AI 聊天会话已失效，当前仍停留在登录路由，未提交消息。")
+
     print("等待聊天输入框加载...")
     input_box = find_displayed_element(page, CHAT_INPUT_SELECTORS, timeout=20)
     if not input_box:
@@ -400,8 +513,16 @@ def chat_and_earn_points(page: ChromiumPage) -> None:
         time.sleep(1)
 
     if not latest_reply:
+        print(
+            "[-] 回复容器未识别；页面 DOM 线索："
+            f"{json.dumps(get_chat_dom_hints(page), ensure_ascii=False)}"
+        )
         raise RuntimeError("[!] 已提交消息，但未能定位到 AI 回复。")
     if stable_count < 4:
+        print(
+            "[-] 回复稳定性检查未通过；页面 DOM 线索："
+            f"{json.dumps(get_chat_dom_hints(page), ensure_ascii=False)}"
+        )
         raise RuntimeError("[!] AI 回复在等待超时前仍未完成。")
 
     print("=== AI 助手回复 ===")
@@ -454,11 +575,14 @@ def main() -> None:
                 if load_cookies(page, cookie_file):
                     print("正在验证 Cookie 是否有效...")
                     page.get(CHAT_URL)
-                    if find_displayed_element(page, CHAT_INPUT_SELECTORS, timeout=10):
+                    if is_chat_authenticated(page):
                         print(f"[*] 账号 {my_username} 免密登录成功！")
                         is_logged_in = True
                     else:
-                        print("[-] Cookie 已失效，准备进行账密登录...")
+                        print(
+                            "[-] Cookie 未能进入已登录聊天路由，"
+                            f"当前路由 {get_chat_route(page)}；准备进行账密登录..."
+                        )
 
             # === 登录流程 (如果 Cookie 无效) ===
             if not is_logged_in:
@@ -509,6 +633,8 @@ class NumericOcrSolver:
         return cls._instance
 
     def _init_engine(self) -> None:
+        import ddddocr
+
         self.ocr = ddddocr.DdddOcr(show_ad=False)
         self.ocr.set_ranges(0)
 
